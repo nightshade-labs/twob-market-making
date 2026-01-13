@@ -1,7 +1,9 @@
 pub mod accounts;
+pub mod instructions;
 
 // Re-export commonly used types
 pub use accounts::{AccountResolver, PdaResult};
+pub use instructions::*;
 
 /// The TwoB Anchor program ID
 pub const TWOB_PROGRAM_ID: &str = "DkjFmy1YNDDDaXoy3ZvuCnpb294UDbpbT457gUyiFS5V";

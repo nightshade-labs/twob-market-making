@@ -15,7 +15,10 @@ use anchor_client::{
 };
 use anchor_lang::prelude::*;
 use tokio::time::sleep;
-use twob_market_making::AccountResolver;
+use twob_market_making::{
+    AccountResolver, build_update_liquidity_flows_instruction,
+    twob_anchor::client::args::UpdateLiquidityFlows,
+};
 
 use crate::twob_anchor::accounts::{Bookkeeping, LiquidityPosition, Market};
 
@@ -70,34 +73,14 @@ async fn main() -> anyhow::Result<()> {
             let current_slot = program.rpc().get_slot().await.unwrap();
             let reference_index = current_slot / 1000;
 
-            let current_exits_pda = resolver.exits_pda(&market_pda.address(), reference_index);
-            let previous_exits_pda = resolver.exits_pda(&market_pda.address(), reference_index - 1);
+            let update_flows_args = UpdateLiquidityFlows {
+                reference_index: reference_index,
+                base_flow_u64: 1,
+                quote_flow_u64: 1,
+            };
 
-            let current_prices_pda = resolver.prices_pda(&market_pda.address(), reference_index);
-            let previous_prices_pda =
-                resolver.prices_pda(&market_pda.address(), reference_index - 1);
-
-            let update_flows_ix = program
-                .request()
-                .accounts(accounts::UpdateLiquidityFlows {
-                    authority: liquidity_provider.pubkey(),
-                    market: market_pda.address(),
-                    liquidity_position: liquidity_position_pda.address(),
-                    bookkeeping: bookkeeping_pda.address(),
-                    current_exits: current_exits_pda.address(),
-                    previous_exits: previous_exits_pda.address(),
-                    current_prices: current_prices_pda.address(),
-                    previous_prices: previous_prices_pda.address(),
-                    system_program: system_program::ID,
-                })
-                .args(args::UpdateLiquidityFlows {
-                    reference_index: reference_index,
-                    base_flow_u64: 1,
-                    quote_flow_u64: 1,
-                })
-                .instructions()
-                .unwrap()
-                .remove(0);
+            let update_flows_ix =
+                build_update_liquidity_flows_instruction(&program, market_id, update_flows_args);
 
             if let Err(e) = program
                 .request()

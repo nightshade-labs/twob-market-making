@@ -2,11 +2,10 @@ use anchor_client::{Program, solana_sdk::signature::Keypair};
 use anchor_lang::prelude::{instruction::Instruction, *};
 use std::sync::Arc;
 
-declare_program!(twob_anchor);
-
-use twob_anchor::{client::accounts, client::args};
-
-use crate::AccountResolver;
+use crate::{
+    AccountResolver,
+    twob_anchor::{self, client::accounts, client::args},
+};
 
 pub fn build_update_liquidity_flows_instruction(
     program: &Program<Arc<Keypair>>,

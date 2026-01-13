@@ -16,14 +16,15 @@ use anchor_client::{
 use anchor_lang::prelude::*;
 use tokio::time::sleep;
 use twob_market_making::{
-    AccountResolver, build_update_liquidity_flows_instruction,
-    twob_anchor::client::args::UpdateLiquidityFlows,
+    AccountResolver, LiquidityPositionBalances, build_update_liquidity_flows_instruction,
+    get_liquidity_position_balances,
+    twob_anchor::{
+        accounts::{Bookkeeping, LiquidityPosition, Market},
+        client::args::UpdateLiquidityFlows,
+    },
 };
 
-use crate::twob_anchor::accounts::{Bookkeeping, LiquidityPosition, Market};
-
 declare_program!(twob_anchor);
-use twob_anchor::{client::accounts, client::args};
 
 const BOOKKEEPING_PRECISION_FACTOR: u128 = 1_000_000_000_000_000;
 const FLOW_PRECISION: u128 = 1_000_000_000;
@@ -100,54 +101,17 @@ async fn main() -> anyhow::Result<()> {
     // Calculate balances
     let current_slot = program.rpc().get_slot().await?;
 
-    let inactive_slots =
-        bookkeeping.slots_without_trade - liquidity_position.slots_without_trade_snapshot;
+    let LiquidityPositionBalances {
+        base_balance,
+        quote_balance,
+        base_debt,
+        quote_debt,
+    } = get_liquidity_position_balances(liquidity_position, bookkeeping, market, current_slot);
 
-    // Base token outflow since last update slot
-    let accumulated_base_outflow = BOOKKEEPING_PRECISION_FACTOR
-        * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
-        * liquidity_position.base_flow_u64 as u128;
-    // Base token inflow since last update slot
-    let accumulated_base_inflow = (bookkeeping.base_per_quote
-        + BOOKKEEPING_PRECISION_FACTOR / FLOW_PRECISION * market.base_flow / market.quote_flow
-            * FLOW_PRECISION
-            * (current_slot - bookkeeping.last_update_slot) as u128
-        - liquidity_position.base_per_quote_snapshot)
-        * liquidity_position.quote_flow_u64 as u128;
-
-    // Quote token outflow since last update slot
-    let accumulated_quote_outflow = BOOKKEEPING_PRECISION_FACTOR
-        * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
-        * liquidity_position.quote_flow_u64 as u128;
-    // Quote token inflow since last update slot
-    let accumulated_quote_inflow = (bookkeeping.quote_per_base
-        + BOOKKEEPING_PRECISION_FACTOR / FLOW_PRECISION * market.quote_flow / market.base_flow
-            * FLOW_PRECISION
-            * (current_slot - bookkeeping.last_update_slot) as u128
-        - liquidity_position.quote_per_base_snapshot)
-        * liquidity_position.base_flow_u64 as u128;
-
-    let base_balance;
-    if accumulated_base_outflow > liquidity_position.base_balance + accumulated_base_inflow {
-        println!("Alarm! Position accumulated debt! Need to stop position");
-        return Ok(());
-    } else {
-        base_balance = (liquidity_position.base_balance + accumulated_base_inflow
-            - accumulated_base_outflow)
-            / BOOKKEEPING_PRECISION_FACTOR;
-        println!("Base balance {}", base_balance)
-    }
-
-    let quote_balance;
-    if accumulated_quote_outflow > liquidity_position.quote_balance + accumulated_quote_inflow {
-        println!("Alarm! Position accumulated debt! Need to stop position");
-        return Ok(());
-    } else {
-        quote_balance = (liquidity_position.quote_balance + accumulated_quote_inflow
-            - accumulated_quote_outflow)
-            / BOOKKEEPING_PRECISION_FACTOR;
-        println!("Quote balance {}", quote_balance)
-    }
+    println!("Base balance {}", base_balance);
+    println!("Quote balance {}", quote_balance);
+    println!("Base debt {}", base_debt);
+    println!("Quote debt {}", quote_debt);
 
     // Calculate when to update flows
 
@@ -164,13 +128,13 @@ async fn main() -> anyhow::Result<()> {
     if base_outflow > base_inflow {
         let delta_base_outflow = base_outflow - base_inflow;
 
-        let slots_unit_debt = base_balance / delta_base_outflow;
+        let slots_unit_debt = base_balance / delta_base_outflow as u64;
 
         println!("Slots until debt: {}", slots_unit_debt);
     } else if quote_outflow > quote_inflow {
         let delta_quote_outflow = quote_outflow - quote_inflow;
 
-        let slots_unit_debt = quote_balance / delta_quote_outflow;
+        let slots_unit_debt = quote_balance / delta_quote_outflow as u64;
 
         println!("Slots until debt: {}", slots_unit_debt);
     }

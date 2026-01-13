@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     // Calculate balances
     let current_slot = program.rpc().get_slot().await?;
 
+    // TODO:To get accurate data we need to either update bookkeeping before or account for exits between last update slot and current slot
     let LiquidityPositionBalances {
         base_balance,
         quote_balance,

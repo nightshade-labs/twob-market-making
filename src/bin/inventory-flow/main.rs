@@ -26,9 +26,6 @@ use twob_market_making::{
 
 declare_program!(twob_anchor);
 
-const BOOKKEEPING_PRECISION_FACTOR: u128 = 1_000_000_000_000_000;
-const FLOW_PRECISION: u128 = 1_000_000_000;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let liquidity_provider = read_keypair_file("/Users/thgehr/.config/solana/lp1.json")

@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use anchor_client::{Program, solana_sdk::signature::Keypair};
 use anchor_lang::prelude::*;
 
 pub mod accounts;
@@ -11,6 +14,8 @@ pub use instructions::*;
 
 declare_program!(twob_anchor);
 use twob_anchor::accounts::{Bookkeeping, LiquidityPosition, Market};
+
+use crate::twob_anchor::accounts::Exits;
 
 /// The TwoB Anchor program ID
 pub const TWOB_PROGRAM_ID: &str = "DkjFmy1YNDDDaXoy3ZvuCnpb294UDbpbT457gUyiFS5V";
@@ -26,13 +31,16 @@ pub struct LiquidityPositionBalances {
     pub base_debt: u64,
     pub quote_debt: u64,
 }
-
-pub fn get_liquidity_position_balances(
+pub async fn get_liquidity_position_balances(
+    program: &Program<Arc<Keypair>>,
     liquidity_position: LiquidityPosition,
     bookkeeping: Bookkeeping,
     market: Market,
     current_slot: u64,
 ) -> LiquidityPositionBalances {
+    let resolver = AccountResolver::new(twob_anchor::ID);
+    let market_pda = resolver.market_pda(market.id);
+
     let inactive_slots =
         bookkeeping.slots_without_trade - liquidity_position.slots_without_trade_snapshot;
 
@@ -41,26 +49,190 @@ pub fn get_liquidity_position_balances(
         * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
         * liquidity_position.base_flow_u64 as u128;
 
-    // Base token inflow since last update slot
-    let accumulated_base_inflow = (bookkeeping.base_per_quote
-        + BOOKKEEPING_PRECISION_FACTOR / FLOW_PRECISION * market.base_flow / market.quote_flow
-            * FLOW_PRECISION
-            * (current_slot - bookkeeping.last_update_slot) as u128
-        - liquidity_position.base_per_quote_snapshot)
-        * liquidity_position.quote_flow_u64 as u128;
-
     // Quote token outflow since last update slot
     let accumulated_quote_outflow = BOOKKEEPING_PRECISION_FACTOR
         * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
         * liquidity_position.quote_flow_u64 as u128;
 
+    println!("Accumulated base outflow {}", accumulated_base_outflow);
+    println!("Accumulated quote outflow {}", accumulated_quote_outflow);
+
+    // Cacluclation token inflow is a bit tricky since we only have data up to bookkeeping last update slot.
+    // We need to go from there till current slot and loop through the exits accounts to adapt market flows
+    // First calculate correct base_per_quote and use that then.
+    let base_per_quote = {
+        let mut base_per_quote = bookkeeping.base_per_quote;
+        let mut market_base_flow = market.base_flow;
+        let mut market_quote_flow = market.quote_flow;
+        let mut last_update_slot = bookkeeping.last_update_slot;
+
+        let last_update_index = last_update_slot / ARRAY_LENGTH / market.end_slot_interval;
+        let current_slot_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
+        println!("current slot {}", current_slot);
+        println!(
+            "lp position last update slot {}",
+            liquidity_position.last_update_slot
+        );
+        println!("last update index {}", last_update_index);
+        println!("Current index {}", current_slot_index);
+
+        // This will sum up all prices up to the last index of the last exits account
+        // After that we still need to sum up prices from that point until the current slot
+        for exits_index in last_update_index..=current_slot_index {
+            let exits_account_pda = resolver.exits_pda(&market_pda.address(), exits_index);
+
+            let exits_account = program.account::<Exits>(exits_account_pda.address()).await;
+
+            let start_index = if exits_index == last_update_index {
+                (bookkeeping.last_update_slot
+                    - last_update_index * market.end_slot_interval * ARRAY_LENGTH)
+                    / market.end_slot_interval
+                    + 1
+            } else {
+                0
+            };
+
+            let end_index = if exits_index == current_slot_index {
+                (current_slot - current_slot_index * market.end_slot_interval * ARRAY_LENGTH)
+                    / market.end_slot_interval
+            } else {
+                ARRAY_LENGTH - 1
+            };
+
+            println!("Start index {}", start_index);
+            println!("End index {}", end_index);
+
+            for i in start_index..=end_index {
+                let slot = i * market.end_slot_interval
+                    + exits_index * market.end_slot_interval * ARRAY_LENGTH;
+                let slot_diff = slot - last_update_slot;
+                last_update_slot = slot;
+
+                println!("slot diff {}", slot_diff);
+                println!("market base flow {}", market_base_flow);
+                println!("market quote flow {}", market_quote_flow);
+                if market_base_flow == 0 || market_quote_flow == 0 {
+                    continue;
+                }
+                base_per_quote += BOOKKEEPING_PRECISION_FACTOR * market_base_flow
+                    / market_quote_flow
+                    * slot_diff as u128;
+
+                let base_exit = match exits_account {
+                    Ok(exits) => exits.base_exits[i as usize],
+                    Err(_) => 0,
+                };
+                let quote_exit = match exits_account {
+                    Ok(exits) => exits.quote_exits[i as usize],
+                    Err(_) => 0,
+                };
+                market_base_flow -= base_exit;
+                market_quote_flow -= quote_exit;
+            }
+
+            // After we went to all exits account we need to sum up prices up to current slot
+            if exits_index == current_slot_index {
+                let slot_diff = current_slot - last_update_slot;
+                if market_base_flow == 0 || market_quote_flow == 0 {
+                    continue;
+                }
+                base_per_quote += BOOKKEEPING_PRECISION_FACTOR * market_base_flow
+                    / market_quote_flow
+                    * slot_diff as u128;
+            }
+        }
+        base_per_quote
+    };
+
+    let quote_per_base = {
+        let mut quote_per_base = bookkeeping.quote_per_base;
+        let mut market_base_flow = market.base_flow;
+        let mut market_quote_flow = market.quote_flow;
+        let mut last_update_slot = bookkeeping.last_update_slot;
+
+        let last_update_index = last_update_slot / ARRAY_LENGTH / market.end_slot_interval;
+        let current_slot_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
+
+        for exits_index in last_update_index..=current_slot_index {
+            let exits_account_pda = resolver.exits_pda(&market_pda.address(), exits_index);
+            let exits_account = program.account::<Exits>(exits_account_pda.address()).await;
+
+            let start_index = if exits_index == last_update_index {
+                (bookkeeping.last_update_slot
+                    - last_update_index * market.end_slot_interval * ARRAY_LENGTH)
+                    / market.end_slot_interval
+                    + 1
+            } else {
+                0
+            };
+
+            let end_index = if exits_index == current_slot_index {
+                (current_slot - current_slot_index * market.end_slot_interval * ARRAY_LENGTH)
+                    / market.end_slot_interval
+            } else {
+                ARRAY_LENGTH - 1
+            };
+
+            for i in start_index..=end_index {
+                let slot = i * market.end_slot_interval
+                    + exits_index * market.end_slot_interval * ARRAY_LENGTH;
+                let slot_diff = slot - last_update_slot;
+                last_update_slot = slot;
+                if market_base_flow == 0 || market_quote_flow == 0 {
+                    continue;
+                }
+                quote_per_base += BOOKKEEPING_PRECISION_FACTOR * market_quote_flow
+                    / market_base_flow
+                    * slot_diff as u128;
+
+                let base_exit = match exits_account {
+                    Ok(exits) => exits.base_exits[i as usize],
+                    Err(_) => 0,
+                };
+                let quote_exit = match exits_account {
+                    Ok(exits) => exits.quote_exits[i as usize],
+                    Err(_) => 0,
+                };
+                market_base_flow -= base_exit;
+                market_quote_flow -= quote_exit;
+            }
+
+            // After we went to all exits account we need to sum up prices up to current slot
+            if exits_index == current_slot_index {
+                let slot_diff = current_slot - last_update_slot;
+                if market_base_flow == 0 || market_quote_flow == 0 {
+                    continue;
+                }
+                quote_per_base += BOOKKEEPING_PRECISION_FACTOR * market_quote_flow
+                    / market_base_flow
+                    * slot_diff as u128;
+            }
+        }
+        quote_per_base
+    };
+
+    println!("Base per quote {}", base_per_quote);
+    println!(
+        "Liquidity base per quote {}",
+        liquidity_position.base_per_quote_snapshot
+    );
+
+    println!("Quote per base {}", quote_per_base);
+    println!(
+        "Liquidity quote per base {}",
+        liquidity_position.quote_per_base_snapshot
+    );
+
+    // Base token inflow since last update slot
+    let accumulated_base_inflow = (base_per_quote - liquidity_position.base_per_quote_snapshot)
+        * liquidity_position.quote_flow_u64 as u128;
+
     // Quote token inflow since last update slot
-    let accumulated_quote_inflow = (bookkeeping.quote_per_base
-        + BOOKKEEPING_PRECISION_FACTOR / FLOW_PRECISION * market.quote_flow / market.base_flow
-            * FLOW_PRECISION
-            * (current_slot - bookkeeping.last_update_slot) as u128
-        - liquidity_position.quote_per_base_snapshot)
+    let accumulated_quote_inflow = (quote_per_base - liquidity_position.quote_per_base_snapshot)
         * liquidity_position.base_flow_u64 as u128;
+
+    println!("Accumulated base inflow {}", accumulated_base_inflow);
+    println!("Accumulated quote inflow {}", accumulated_quote_inflow);
 
     let base_balance;
     let base_debt;

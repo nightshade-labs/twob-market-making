@@ -13,18 +13,19 @@ use anchor_client::{
         commitment_config::CommitmentConfig, signature::read_keypair_file, signer::Signer,
     },
 };
-use anchor_lang::prelude::*;
+
 use tokio::time::sleep;
 use twob_market_making::{
-    AccountResolver, LiquidityPositionBalances, build_update_liquidity_flows_instruction,
-    get_liquidity_position_balances,
+    ARRAY_LENGTH, AccountResolver, LiquidityPositionBalances,
+    build_update_liquidity_flows_instruction, get_liquidity_position_balances,
     twob_anchor::{
+        self,
         accounts::{Bookkeeping, LiquidityPosition, Market},
         client::args::UpdateLiquidityFlows,
     },
 };
 
-declare_program!(twob_anchor);
+// declare_program!(twob_anchor);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -63,13 +64,13 @@ async fn main() -> anyhow::Result<()> {
     // Update flows every x minutes
     let update_flows_task = tokio::spawn(async move {
         loop {
-            sleep(Duration::from_mins(1)).await;
+            sleep(Duration::from_mins(5)).await;
 
             let liquidity_provider = liquidity_provider.clone();
             let program = client.program(twob_anchor::ID).unwrap();
 
             let current_slot = program.rpc().get_slot().await.unwrap();
-            let reference_index = current_slot / 1000;
+            let reference_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
 
             let update_flows_args = UpdateLiquidityFlows {
                 reference_index: reference_index,
@@ -98,13 +99,20 @@ async fn main() -> anyhow::Result<()> {
     // Calculate balances
     let current_slot = program.rpc().get_slot().await?;
 
-    // TODO:To get accurate data we need to either update bookkeeping before or account for exits between last update slot and current slot
+    // TODO: To get accurate data we need to either update bookkeeping before or account for exits between last update slot and current slot
     let LiquidityPositionBalances {
         base_balance,
         quote_balance,
         base_debt,
         quote_debt,
-    } = get_liquidity_position_balances(liquidity_position, bookkeeping, market, current_slot);
+    } = get_liquidity_position_balances(
+        &program,
+        liquidity_position,
+        bookkeeping,
+        market,
+        current_slot,
+    )
+    .await;
 
     println!("Base balance {}", base_balance);
     println!("Quote balance {}", quote_balance);
@@ -112,16 +120,10 @@ async fn main() -> anyhow::Result<()> {
     println!("Quote debt {}", quote_debt);
 
     // Calculate when to update flows
-
     let base_outflow = liquidity_position.base_flow_u64 as u128;
     let quote_outflow = liquidity_position.quote_flow_u64 as u128;
     let base_inflow = quote_outflow * market.base_flow / market.quote_flow;
     let quote_inflow = base_outflow * market.quote_flow / market.base_flow;
-
-    println!("Base outflow {}", base_outflow);
-    println!("Base iinflow {}", base_inflow);
-    println!("Quote outflow {}", quote_outflow);
-    println!("Quote iinflow {}", quote_inflow);
 
     if base_outflow > base_inflow {
         let delta_base_outflow = base_outflow - base_inflow;
@@ -136,10 +138,6 @@ async fn main() -> anyhow::Result<()> {
 
         println!("Slots until debt: {}", slots_unit_debt);
     }
-
-    println!("Current slot {}", current_slot);
-    println!("Liquidity position {:?}", liquidity_position);
-    println!("Bookkeeping {:?}", bookkeeping);
 
     tokio::try_join!(update_flows_task)?;
     Ok(())

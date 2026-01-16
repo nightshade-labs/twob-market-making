@@ -4,7 +4,7 @@
 // Listen to twob market price updates
 // - recalculate at which slot flows should be updated
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration, u64};
 
 // When update flow timer is triggered, update flows
 use anchor_client::{
@@ -14,7 +14,7 @@ use anchor_client::{
     },
 };
 
-use tokio::time::sleep;
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use twob_market_making::{
     ARRAY_LENGTH, AccountResolver, LiquidityPositionBalances,
     build_update_liquidity_flows_instruction, get_liquidity_position_balances,
@@ -22,6 +22,7 @@ use twob_market_making::{
         self,
         accounts::{Bookkeeping, LiquidityPosition, Market},
         client::args::UpdateLiquidityFlows,
+        events::MarketUpdateEvent,
     },
 };
 
@@ -39,11 +40,11 @@ async fn main() -> anyhow::Result<()> {
     let market_id = 1u64;
 
     let liquidity_provider = std::sync::Arc::new(liquidity_provider);
-    let client = Client::new_with_options(
+    let client = Arc::new(Client::new_with_options(
         url,
         liquidity_provider.clone(),
         CommitmentConfig::confirmed(),
-    );
+    ));
 
     let program = client.program(twob_anchor::ID)?;
     let resolver = AccountResolver::new(twob_anchor::ID);
@@ -53,29 +54,53 @@ async fn main() -> anyhow::Result<()> {
         resolver.liquidity_position_pda(&market_pda.address(), &liquidity_provider.pubkey());
     let bookkeeping_pda = resolver.bookkeeping_pda(&market_pda.address());
 
-    let market = program.account::<Market>(market_pda.address()).await?;
-    let liquidity_position = program
-        .account::<LiquidityPosition>(liquidity_position_pda.address())
-        .await?;
-    let bookkeeping = program
-        .account::<Bookkeeping>(bookkeeping_pda.address())
-        .await?;
-
+    let client_clone = client.clone();
+    let liquidity_provider_clone = liquidity_provider.clone();
     // Update flows every x minutes
     let update_flows_task = tokio::spawn(async move {
         loop {
-            sleep(Duration::from_mins(5)).await;
+            let liquidity_provider = liquidity_provider_clone.clone();
+            let program = client_clone.program(twob_anchor::ID).unwrap();
 
-            let liquidity_provider = liquidity_provider.clone();
-            let program = client.program(twob_anchor::ID).unwrap();
+            let market = program
+                .account::<Market>(market_pda.address())
+                .await
+                .unwrap();
+            let liquidity_position = program
+                .account::<LiquidityPosition>(liquidity_position_pda.address())
+                .await
+                .unwrap();
+            let bookkeeping = program
+                .account::<Bookkeeping>(bookkeeping_pda.address())
+                .await
+                .unwrap();
 
             let current_slot = program.rpc().get_slot().await.unwrap();
             let reference_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
 
+            let LiquidityPositionBalances {
+                base_balance,
+                quote_balance,
+                base_debt,
+                quote_debt,
+            } = get_liquidity_position_balances(
+                &program,
+                liquidity_position,
+                bookkeeping,
+                market,
+                current_slot,
+            )
+            .await;
+
+            if base_debt > 0 || quote_debt > 0 {
+                // TODO: Stop liquidity position
+                println!("🚨🚨🚨🚨, position has accumulated debt. Stop position");
+            }
+
             let update_flows_args = UpdateLiquidityFlows {
                 reference_index: reference_index,
-                base_flow_u64: 1,
-                quote_flow_u64: 1,
+                base_flow_u64: base_balance / 5,
+                quote_flow_u64: quote_balance / 5,
             };
 
             let update_flows_ix =
@@ -90,55 +115,163 @@ async fn main() -> anyhow::Result<()> {
             {
                 eprintln!("Failed to update flows: {}", e);
             };
+
+            println!("Updated flow in regular loop");
+            sleep(Duration::from_mins(5)).await;
         }
     });
 
-    ////////
-    // TODO: Update flows if slots until debt is smaller than y (maybe around 1000)
-    ////////
-    // Calculate balances
-    let current_slot = program.rpc().get_slot().await?;
+    let (market_update_event_sender, mut market_update_event_receiver) = mpsc::unbounded_channel();
+    let market_update_event_unsubscriber = program
+        .on(move |event_ctx, event: MarketUpdateEvent| {
+            if market_update_event_sender
+                .send((event_ctx.signature, event_ctx.slot, event))
+                .is_err()
+            {
+                println!("Error while transferring the event.")
+            }
+        })
+        .await?;
 
-    // TODO: To get accurate data we need to either update bookkeeping before or account for exits between last update slot and current slot
-    let LiquidityPositionBalances {
-        base_balance,
-        quote_balance,
-        base_debt,
-        quote_debt,
-    } = get_liquidity_position_balances(
-        &program,
-        liquidity_position,
-        bookkeeping,
-        market,
-        current_slot,
-    )
-    .await;
+    let mut current_task: Option<JoinHandle<()>> = None;
 
-    println!("Base balance {}", base_balance);
-    println!("Quote balance {}", quote_balance);
-    println!("Base debt {}", base_debt);
-    println!("Quote debt {}", quote_debt);
+    while let Some(_event) = market_update_event_receiver.recv().await {
+        if let Some(handle) = current_task.take() {
+            println!("Aborting task");
+            handle.abort();
+        }
+        let liquidity_provider = liquidity_provider.clone();
+        let client = client.clone();
 
-    // Calculate when to update flows
-    let base_outflow = liquidity_position.base_flow_u64 as u128;
-    let quote_outflow = liquidity_position.quote_flow_u64 as u128;
-    let base_inflow = quote_outflow * market.base_flow / market.quote_flow;
-    let quote_inflow = base_outflow * market.quote_flow / market.base_flow;
+        let current_slot = program.rpc().get_slot().await.unwrap();
 
-    if base_outflow > base_inflow {
-        let delta_base_outflow = base_outflow - base_inflow;
+        let market = program
+            .account::<Market>(market_pda.address())
+            .await
+            .unwrap();
+        let liquidity_position = program
+            .account::<LiquidityPosition>(liquidity_position_pda.address())
+            .await
+            .unwrap();
+        let bookkeeping = program
+            .account::<Bookkeeping>(bookkeeping_pda.address())
+            .await
+            .unwrap();
 
-        let slots_unit_debt = base_balance / delta_base_outflow as u64;
+        let LiquidityPositionBalances {
+            base_balance,
+            quote_balance,
+            base_debt,
+            quote_debt,
+        } = get_liquidity_position_balances(
+            &program,
+            liquidity_position,
+            bookkeeping,
+            market,
+            current_slot,
+        )
+        .await;
 
-        println!("Slots until debt: {}", slots_unit_debt);
-    } else if quote_outflow > quote_inflow {
-        let delta_quote_outflow = quote_outflow - quote_inflow;
+        if base_debt > 0 || quote_debt > 0 {
+            // TODO: Stop liquidity position
+            println!("🚨🚨🚨🚨, position has accumulated debt. Stop position");
+            return Ok(());
+        }
 
-        let slots_unit_debt = quote_balance / delta_quote_outflow as u64;
+        let base_outflow = liquidity_position.base_flow_u64 as u128;
+        let quote_outflow = liquidity_position.quote_flow_u64 as u128;
+        let base_inflow = quote_outflow * market.base_flow / market.quote_flow;
+        let quote_inflow = base_outflow * market.quote_flow / market.base_flow;
 
-        println!("Slots until debt: {}", slots_unit_debt);
+        let slots_until_debt = if base_outflow > base_inflow {
+            let delta_base_outflow = base_outflow - base_inflow;
+
+            base_balance / delta_base_outflow as u64
+        } else if quote_outflow > quote_inflow {
+            let delta_quote_outflow = quote_outflow - quote_inflow;
+
+            quote_balance / delta_quote_outflow as u64
+        } else {
+            u64::MAX
+        };
+
+        println!("Slots until debt: {}", slots_until_debt);
+
+        // TODO: Need to analyse which numbers make sense
+        let threshold = 10000;
+        let delay = if slots_until_debt <= 25 {
+            100
+        } else if slots_until_debt <= threshold {
+            2000
+        } else {
+            (slots_until_debt.min(threshold + 1000) - threshold) * 400 + 2000
+        };
+
+        println!("Update flows in {}s", delay / 1000);
+
+        current_task = Some(tokio::spawn(async move {
+            sleep(Duration::from_millis(delay)).await;
+            println!("Update flows");
+
+            let program = client.program(twob_anchor::ID).unwrap();
+
+            let market = program
+                .account::<Market>(market_pda.address())
+                .await
+                .unwrap();
+            let liquidity_position = program
+                .account::<LiquidityPosition>(liquidity_position_pda.address())
+                .await
+                .unwrap();
+            let bookkeeping = program
+                .account::<Bookkeeping>(bookkeeping_pda.address())
+                .await
+                .unwrap();
+
+            let current_slot = program.rpc().get_slot().await.unwrap();
+            let reference_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
+
+            let LiquidityPositionBalances {
+                base_balance,
+                quote_balance,
+                base_debt,
+                quote_debt,
+            } = get_liquidity_position_balances(
+                &program,
+                liquidity_position,
+                bookkeeping,
+                market,
+                current_slot,
+            )
+            .await;
+
+            if base_debt > 0 || quote_debt > 0 {
+                // TODO: Stop liquidity position
+                println!("🚨🚨🚨🚨, position has accumulated debt. Stop position");
+            }
+
+            let update_flows_args = UpdateLiquidityFlows {
+                reference_index: reference_index,
+                base_flow_u64: base_balance / 5,
+                quote_flow_u64: quote_balance / 5,
+            };
+
+            let update_flows_ix =
+                build_update_liquidity_flows_instruction(&program, market_id, update_flows_args);
+
+            if let Err(e) = program
+                .request()
+                .instruction(update_flows_ix)
+                .signer(liquidity_provider)
+                .send()
+                .await
+            {
+                eprintln!("Failed to update flows: {}", e);
+            };
+        }));
     }
 
+    market_update_event_unsubscriber.unsubscribe().await;
     tokio::try_join!(update_flows_task)?;
     Ok(())
 }

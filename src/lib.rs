@@ -54,9 +54,6 @@ pub async fn get_liquidity_position_balances(
         * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
         * liquidity_position.quote_flow_u64 as u128;
 
-    println!("Accumulated base outflow {}", accumulated_base_outflow);
-    println!("Accumulated quote outflow {}", accumulated_quote_outflow);
-
     // Cacluclation token inflow is a bit tricky since we only have data up to bookkeeping last update slot.
     // We need to go from there till current slot and loop through the exits accounts to adapt market flows
     // First calculate correct base_per_quote and use that then.
@@ -68,13 +65,6 @@ pub async fn get_liquidity_position_balances(
 
         let last_update_index = last_update_slot / ARRAY_LENGTH / market.end_slot_interval;
         let current_slot_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
-        println!("current slot {}", current_slot);
-        println!(
-            "lp position last update slot {}",
-            liquidity_position.last_update_slot
-        );
-        println!("last update index {}", last_update_index);
-        println!("Current index {}", current_slot_index);
 
         // This will sum up all prices up to the last index of the last exits account
         // After that we still need to sum up prices from that point until the current slot
@@ -99,18 +89,12 @@ pub async fn get_liquidity_position_balances(
                 ARRAY_LENGTH - 1
             };
 
-            println!("Start index {}", start_index);
-            println!("End index {}", end_index);
-
             for i in start_index..=end_index {
                 let slot = i * market.end_slot_interval
                     + exits_index * market.end_slot_interval * ARRAY_LENGTH;
                 let slot_diff = slot - last_update_slot;
                 last_update_slot = slot;
 
-                println!("slot diff {}", slot_diff);
-                println!("market base flow {}", market_base_flow);
-                println!("market quote flow {}", market_quote_flow);
                 if market_base_flow == 0 || market_quote_flow == 0 {
                     continue;
                 }
@@ -211,18 +195,6 @@ pub async fn get_liquidity_position_balances(
         quote_per_base
     };
 
-    println!("Base per quote {}", base_per_quote);
-    println!(
-        "Liquidity base per quote {}",
-        liquidity_position.base_per_quote_snapshot
-    );
-
-    println!("Quote per base {}", quote_per_base);
-    println!(
-        "Liquidity quote per base {}",
-        liquidity_position.quote_per_base_snapshot
-    );
-
     // Base token inflow since last update slot
     let accumulated_base_inflow = (base_per_quote - liquidity_position.base_per_quote_snapshot)
         * liquidity_position.quote_flow_u64 as u128;
@@ -230,9 +202,6 @@ pub async fn get_liquidity_position_balances(
     // Quote token inflow since last update slot
     let accumulated_quote_inflow = (quote_per_base - liquidity_position.quote_per_base_snapshot)
         * liquidity_position.base_flow_u64 as u128;
-
-    println!("Accumulated base inflow {}", accumulated_base_inflow);
-    println!("Accumulated quote inflow {}", accumulated_quote_inflow);
 
     let base_balance;
     let base_debt;

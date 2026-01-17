@@ -17,11 +17,12 @@ use anchor_client::{
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use twob_market_making::{
     ARRAY_LENGTH, AccountResolver, LiquidityPositionBalances,
-    build_update_liquidity_flows_instruction, get_liquidity_position_balances,
+    build_public_stop_liquidity_position_instruction, build_update_liquidity_flows_instruction,
+    get_liquidity_position_balances,
     twob_anchor::{
         self,
         accounts::{Bookkeeping, LiquidityPosition, Market},
-        client::args::UpdateLiquidityFlows,
+        client::args::{PublicStopLiquidityPosition, UpdateLiquidityFlows},
         events::MarketUpdateEvent,
     },
 };
@@ -93,8 +94,28 @@ async fn main() -> anyhow::Result<()> {
             .await;
 
             if base_debt > 0 || quote_debt > 0 {
-                // TODO: Stop liquidity position
+                // TODO: Send alarm!
                 println!("🚨🚨🚨🚨, position has accumulated debt. Stop position");
+
+                let stop_liquidity_position_args = PublicStopLiquidityPosition { reference_index };
+
+                let stop_liquidity_position_ix = build_public_stop_liquidity_position_instruction(
+                    &program,
+                    market_id,
+                    stop_liquidity_position_args,
+                );
+
+                if let Err(e) = program
+                    .request()
+                    .instruction(stop_liquidity_position_ix)
+                    .signer(liquidity_provider)
+                    .send()
+                    .await
+                {
+                    eprintln!("Failed to update flows: {}", e);
+                };
+
+                return;
             }
 
             let update_flows_args = UpdateLiquidityFlows {
@@ -143,8 +164,6 @@ async fn main() -> anyhow::Result<()> {
         let liquidity_provider = liquidity_provider.clone();
         let client = client.clone();
 
-        let current_slot = program.rpc().get_slot().await.unwrap();
-
         let market = program
             .account::<Market>(market_pda.address())
             .await
@@ -157,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
             .account::<Bookkeeping>(bookkeeping_pda.address())
             .await
             .unwrap();
+
+        let current_slot = program.rpc().get_slot().await.unwrap();
+        let reference_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
 
         let LiquidityPositionBalances {
             base_balance,
@@ -173,8 +195,26 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
         if base_debt > 0 || quote_debt > 0 {
-            // TODO: Stop liquidity position
+            // TODO: Send alarm
             println!("🚨🚨🚨🚨, position has accumulated debt. Stop position");
+            let stop_liquidity_position_args = PublicStopLiquidityPosition { reference_index };
+
+            let stop_liquidity_position_ix = build_public_stop_liquidity_position_instruction(
+                &program,
+                market_id,
+                stop_liquidity_position_args,
+            );
+
+            if let Err(e) = program
+                .request()
+                .instruction(stop_liquidity_position_ix)
+                .signer(liquidity_provider)
+                .send()
+                .await
+            {
+                eprintln!("Failed to update flows: {}", e);
+            };
+
             return Ok(());
         }
 

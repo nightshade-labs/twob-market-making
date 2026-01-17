@@ -10,7 +10,7 @@ use crate::{
 pub fn build_public_stop_liquidity_position_instruction(
     program: &Program<Arc<Keypair>>,
     market_id: u64,
-    update_flows_args: args::PublicStopLiquidityPosition,
+    stop_liquidity_position_args: args::PublicStopLiquidityPosition,
 ) -> Instruction {
     let resolver = AccountResolver::new(twob_anchor::ID);
 
@@ -19,14 +19,22 @@ pub fn build_public_stop_liquidity_position_instruction(
     let liquidity_position_pda =
         resolver.liquidity_position_pda(&market_pda.address(), &liquidity_provider);
     let bookkeeping_pda = resolver.bookkeeping_pda(&market_pda.address());
-    let current_exits_pda =
-        resolver.exits_pda(&market_pda.address(), update_flows_args.reference_index);
-    let previous_exits_pda =
-        resolver.exits_pda(&market_pda.address(), update_flows_args.reference_index - 1);
-    let current_prices_pda =
-        resolver.prices_pda(&market_pda.address(), update_flows_args.reference_index);
-    let previous_prices_pda =
-        resolver.prices_pda(&market_pda.address(), update_flows_args.reference_index - 1);
+    let current_exits_pda = resolver.exits_pda(
+        &market_pda.address(),
+        stop_liquidity_position_args.reference_index,
+    );
+    let previous_exits_pda = resolver.exits_pda(
+        &market_pda.address(),
+        stop_liquidity_position_args.reference_index - 1,
+    );
+    let current_prices_pda = resolver.prices_pda(
+        &market_pda.address(),
+        stop_liquidity_position_args.reference_index,
+    );
+    let previous_prices_pda = resolver.prices_pda(
+        &market_pda.address(),
+        stop_liquidity_position_args.reference_index - 1,
+    );
 
     program
         .request()
@@ -42,7 +50,7 @@ pub fn build_public_stop_liquidity_position_instruction(
             previous_prices: previous_prices_pda.address(),
             system_program: system_program::ID,
         })
-        .args(update_flows_args)
+        .args(stop_liquidity_position_args)
         .instructions()
         .unwrap()
         .remove(0)

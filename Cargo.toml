@@ -9,5 +9,7 @@ anchor-lang = "0.32.1"
 anchor-spl = "0.32.1"
 anyhow = "1.0.93"
 dotenv = "0.15.0"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
 solana-rpc-client-types = "2.3.13"
 tokio = { version = "1.0", features = ["full"] }

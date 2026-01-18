@@ -46,6 +46,13 @@ pub async fn get_liquidity_position_balances(
     let inactive_slots =
         bookkeeping.slots_without_trade - liquidity_position.slots_without_trade_snapshot;
 
+    // For debugging since sometimes it failed because substraction overflow
+    println!("Current slot {}", current_slot);
+    println!(
+        "LP last update slot {}",
+        liquidity_position.last_update_slot
+    );
+    println!("Inactive slots {}", inactive_slots);
     // Base token outflow since last update slot
     let accumulated_base_outflow = BOOKKEEPING_PRECISION_FACTOR
         * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128

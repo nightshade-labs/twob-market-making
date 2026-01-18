@@ -32,19 +32,10 @@ impl Default for DelayConfig {
     }
 }
 
-fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/")
-        && let Some(home) = env::var_os("HOME")
-    {
-        return format!("{}{}", home.to_string_lossy(), &path[1..]);
-    }
-    path.to_string()
-}
-
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let keypair_path =
-            env::var("KEYPAIR_PATH").unwrap_or_else(|_| expand_tilde("~/.config/solana/id.json"));
+        let keypair_path = env::var("KEYPAIR_PATH")
+            .unwrap_or_else(|_| "Users/thgehr/.config/solana/id.json".to_string());
 
         let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
 

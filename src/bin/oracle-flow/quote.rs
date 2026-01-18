@@ -1,4 +1,6 @@
-use twob_market_making::{MarketState, twob_anchor::accounts::LiquidityPosition};
+use twob_market_making::{
+    LiquidityPositionBalances, MarketState, twob_anchor::accounts::LiquidityPosition,
+};
 
 use crate::price::PriceData;
 
@@ -15,11 +17,12 @@ pub fn calculate_optimal_quote(
     _price: &PriceData,
     _position: &LiquidityPosition,
     _market_state: &MarketState,
+    _balances: &LiquidityPositionBalances,
 ) -> OptimalQuote {
     // Placeholder: returns current flows unchanged
     // Replace with your formula that considers:
     // - External price (price.price)
-    // - Position inventory (position.base_balance, position.quote_balance)
+    // - Position balances (balances.base_balance, balances.quote_balance)
     // - Market state (market_state.market.base_flow, market_state.market.quote_flow)
     todo!("Implement optimal quote calculation formula")
 }

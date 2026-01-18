@@ -1,6 +1,7 @@
 mod config;
 mod price;
 mod quote;
+mod rebalance;
 
 use std::{sync::Arc, time::Duration};
 
@@ -13,9 +14,11 @@ use anchor_client::{
 use config::Config;
 use price::fetch_price;
 use quote::{calculate_optimal_quote, should_update_quote};
+use rebalance::{execute_rebalance, needs_rebalance};
 use tokio::{signal, time::sleep};
 use twob_market_making::{
-    ARRAY_LENGTH, execute_update_flows, fetch_liquidity_position, fetch_market_state, twob_anchor,
+    ARRAY_LENGTH, execute_update_flows, fetch_liquidity_position, fetch_market_state,
+    get_liquidity_position_balances, twob_anchor,
 };
 
 #[tokio::main]
@@ -83,11 +86,45 @@ async fn run_update_cycle(
     println!("Fetched price: {}", price_data.price);
 
     // 2. Fetch liquidity position and market state
-    let market_state = fetch_market_state(program, market_id).await?;
-    let position = fetch_liquidity_position(program, market_id, authority).await?;
+    let mut market_state = fetch_market_state(program, market_id).await?;
+    let mut position = fetch_liquidity_position(program, market_id, authority).await?;
+    let mut balances = get_liquidity_position_balances(
+        program,
+        position,
+        market_state.bookkeeping,
+        market_state.market,
+        market_state.current_slot,
+    )
+    .await;
 
-    // 3. Calculate optimal quote
-    let optimal = calculate_optimal_quote(&price_data, &position, &market_state);
+    // 3. Check if rebalance is needed
+    if needs_rebalance(&price_data, &balances, &market_state) {
+        println!("Inventory rebalance needed");
+        execute_rebalance(
+            program,
+            market_id,
+            &price_data,
+            &balances,
+            liquidity_provider.clone(),
+        )
+        .await?;
+
+        // Re-fetch position data after rebalance
+        market_state = fetch_market_state(program, market_id).await?;
+        position = fetch_liquidity_position(program, market_id, authority).await?;
+        balances = get_liquidity_position_balances(
+            program,
+            position,
+            market_state.bookkeeping,
+            market_state.market,
+            market_state.current_slot,
+        )
+        .await;
+        println!("Rebalance completed, position data refreshed");
+    }
+
+    // 4. Calculate optimal quote
+    let optimal = calculate_optimal_quote(&price_data, &position, &market_state, &balances);
 
     // 4. Get current quote from position
     let current_base_flow = position.base_flow_u64;

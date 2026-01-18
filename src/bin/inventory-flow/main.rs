@@ -1,49 +1,63 @@
+mod config;
 mod position;
 
 use std::{sync::Arc, time::Duration};
 
 use anchor_client::{
-    Client, Cluster,
+    Client,
     solana_sdk::{
         commitment_config::CommitmentConfig, signature::read_keypair_file, signer::Signer,
     },
 };
-use position::{PositionAction, calculate_update_delay, evaluate_position};
+use config::{Config, DelayConfig};
+use position::{EvaluationResult, PositionAction, calculate_update_delay, evaluate_position};
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use twob_market_making::{
-    LiquidityPositionBalances, execute_stop_position, execute_update_flows,
+    execute_stop_position, execute_update_flows,
     twob_anchor::{self, events::MarketUpdateEvent},
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let liquidity_provider = read_keypair_file("/Users/thgehr/.config/solana/lp1.json")
-        .expect("Keypair file is required");
-    let url = Cluster::Custom(
-        "http://127.0.0.1:8899".to_string(),
-        "ws://127.0.0.1:8900".to_string(),
-    );
-    let market_id = 1u64;
+    dotenv::dotenv().ok();
+
+    let config = Config::from_env()?;
+    let delay_config = DelayConfig::default();
+
+    let liquidity_provider = read_keypair_file(&config.keypair_path).map_err(|e| {
+        anyhow::anyhow!("Failed to read keypair from {}: {}", config.keypair_path, e)
+    })?;
 
     let liquidity_provider = Arc::new(liquidity_provider);
     let client = Arc::new(Client::new_with_options(
-        url,
+        config.cluster(),
         liquidity_provider.clone(),
         CommitmentConfig::confirmed(),
     ));
 
     let program = client.program(twob_anchor::ID)?;
     let authority = liquidity_provider.pubkey();
+    let market_id = config.market_id;
+    let flow_divisor = config.flow_divisor;
 
     // Periodic update task
+    // Keeps inventory balanced within acceptable bounds
     let client_periodic = client.clone();
     let lp_periodic = liquidity_provider.clone();
     let update_flows_task = tokio::spawn(async move {
         loop {
-            let program = client_periodic.program(twob_anchor::ID).unwrap();
+            let program = match client_periodic.program(twob_anchor::ID) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to get program client: {}", e);
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
 
-            match evaluate_position(&program, market_id, &lp_periodic.pubkey()).await {
-                Ok((action, _, _)) => match action {
+            match evaluate_position(&program, market_id, &lp_periodic.pubkey(), flow_divisor).await
+            {
+                Ok(EvaluationResult { action, .. }) => match action {
                     PositionAction::Stop { reference_index } => {
                         if let Err(e) = execute_stop_position(
                             &program,
@@ -85,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Event-driven updates
+    // Reevaluate when position needs to be updated to not become unhealthy
     let (tx, mut rx) = mpsc::unbounded_channel();
     let _unsubscriber = program
         .on(move |ctx, event: MarketUpdateEvent| {
@@ -104,8 +119,8 @@ async fn main() -> anyhow::Result<()> {
 
         let program = client.program(twob_anchor::ID)?;
 
-        match evaluate_position(&program, market_id, &authority).await {
-            Ok((action, market_state, position)) => match action {
+        match evaluate_position(&program, market_id, &authority, flow_divisor).await {
+            Ok(result) => match result.action {
                 PositionAction::Stop { reference_index } => {
                     if let Err(e) =
                         execute_stop_position(&program, market_id, reference_index, lp).await
@@ -114,26 +129,29 @@ async fn main() -> anyhow::Result<()> {
                     }
                     return Ok(());
                 }
-                PositionAction::UpdateFlows {
-                    base_flow,
-                    quote_flow,
-                    ..
-                } => {
-                    let balances = LiquidityPositionBalances {
-                        base_balance: base_flow * 5,
-                        quote_balance: quote_flow * 5,
-                        base_debt: 0,
-                        quote_debt: 0,
-                    };
-                    let delay = calculate_update_delay(&position, &market_state, &balances);
+                PositionAction::UpdateFlows { .. } => {
+                    let delay = calculate_update_delay(
+                        &result.position,
+                        &result.market_state,
+                        &result.balances,
+                        &delay_config,
+                    );
 
                     current_task = Some(tokio::spawn(async move {
                         sleep(Duration::from_millis(delay)).await;
 
-                        let program = client.program(twob_anchor::ID).unwrap();
+                        let program = match client.program(twob_anchor::ID) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Failed to get program client: {}", e);
+                                return;
+                            }
+                        };
 
-                        match evaluate_position(&program, market_id, &lp.pubkey()).await {
-                            Ok((action, _, _)) => match action {
+                        match evaluate_position(&program, market_id, &lp.pubkey(), flow_divisor)
+                            .await
+                        {
+                            Ok(EvaluationResult { action, .. }) => match action {
                                 PositionAction::Stop { reference_index } => {
                                     if let Err(e) = execute_stop_position(
                                         &program,

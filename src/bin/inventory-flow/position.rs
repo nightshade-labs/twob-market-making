@@ -7,6 +7,8 @@ use twob_market_making::{
     fetch_market_state, get_liquidity_position_balances, twob_anchor::accounts::LiquidityPosition,
 };
 
+use crate::config::DelayConfig;
+
 pub enum PositionAction {
     Stop {
         reference_index: u64,
@@ -18,23 +20,26 @@ pub enum PositionAction {
     },
 }
 
+pub struct EvaluationResult {
+    pub action: PositionAction,
+    pub market_state: MarketState,
+    pub position: LiquidityPosition,
+    pub balances: LiquidityPositionBalances,
+}
+
 pub async fn evaluate_position(
     program: &Program<Arc<Keypair>>,
     market_id: u64,
     authority: &Pubkey,
-) -> anyhow::Result<(PositionAction, MarketState, LiquidityPosition)> {
+    flow_divisor: u64,
+) -> anyhow::Result<EvaluationResult> {
     let market_state = fetch_market_state(program, market_id).await?;
     let position = fetch_liquidity_position(program, market_id, authority).await?;
 
     let reference_index =
         market_state.current_slot / ARRAY_LENGTH / market_state.market.end_slot_interval;
 
-    let LiquidityPositionBalances {
-        base_balance,
-        quote_balance,
-        base_debt,
-        quote_debt,
-    } = get_liquidity_position_balances(
+    let balances = get_liquidity_position_balances(
         program,
         position,
         market_state.bookkeeping,
@@ -43,29 +48,35 @@ pub async fn evaluate_position(
     )
     .await;
 
-    let action = if base_debt > 0 || quote_debt > 0 {
+    let action = if balances.base_debt > 0 || balances.quote_debt > 0 {
         PositionAction::Stop { reference_index }
     } else {
         PositionAction::UpdateFlows {
-            base_flow: base_balance / 5,
-            quote_flow: quote_balance / 5,
+            base_flow: balances.base_balance / flow_divisor,
+            quote_flow: balances.quote_balance / flow_divisor,
             reference_index,
         }
     };
 
-    Ok((action, market_state, position))
+    Ok(EvaluationResult {
+        action,
+        market_state,
+        position,
+        balances,
+    })
 }
 
 pub fn calculate_update_delay(
     position: &LiquidityPosition,
     market_state: &MarketState,
     balances: &LiquidityPositionBalances,
+    delay_config: &DelayConfig,
 ) -> u64 {
     let base_outflow = position.base_flow_u64 as u128;
     let quote_outflow = position.quote_flow_u64 as u128;
 
     if market_state.market.quote_flow == 0 || market_state.market.base_flow == 0 {
-        return 2000;
+        return delay_config.normal_delay_ms as u64;
     }
 
     let base_inflow =
@@ -85,14 +96,15 @@ pub fn calculate_update_delay(
 
     println!("Slots until debt: {}", slots_until_debt);
 
-    // TODO: Analyze which numbers make sense for production
-    let threshold = 10000u128;
-    let delay = if slots_until_debt <= 25 {
-        100
-    } else if slots_until_debt <= threshold {
-        2000
+    let delay = if slots_until_debt <= delay_config.critical_threshold {
+        delay_config.critical_delay_ms
+    } else if slots_until_debt <= delay_config.safe_threshold {
+        delay_config.normal_delay_ms
     } else {
-        (slots_until_debt.min(threshold + 1000) - threshold) * 400 + 2000
+        let additional_slots = slots_until_debt
+            .min(delay_config.safe_threshold + delay_config.max_additional_slots)
+            - delay_config.safe_threshold;
+        additional_slots * delay_config.delay_scale_factor + delay_config.normal_delay_ms
     };
 
     println!("Update flows in {}s", delay / 1000);

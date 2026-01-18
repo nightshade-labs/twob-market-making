@@ -46,3 +46,28 @@ pub fn build_update_liquidity_flows_instruction(
         .unwrap()
         .remove(0)
 }
+
+pub async fn execute_update_flows(
+    program: &Program<Arc<Keypair>>,
+    market_id: u64,
+    base_flow: u64,
+    quote_flow: u64,
+    reference_index: u64,
+    signer: Arc<Keypair>,
+) -> anyhow::Result<()> {
+    let args = args::UpdateLiquidityFlows {
+        reference_index,
+        base_flow_u64: base_flow,
+        quote_flow_u64: quote_flow,
+    };
+    let ix = build_update_liquidity_flows_instruction(program, market_id, args);
+
+    program
+        .request()
+        .instruction(ix)
+        .signer(signer)
+        .send()
+        .await?;
+
+    Ok(())
+}

@@ -6,11 +6,13 @@ use anchor_lang::prelude::*;
 pub mod accounts;
 pub mod constants;
 pub mod instructions;
+pub mod state;
 
 // Re-export commonly used types
 pub use accounts::{AccountResolver, PdaResult};
 pub use constants::*;
 pub use instructions::*;
+pub use state::{MarketState, fetch_liquidity_position, fetch_market_state};
 
 declare_program!(twob_anchor);
 use twob_anchor::accounts::{Bookkeeping, LiquidityPosition, Market};

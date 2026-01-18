@@ -55,3 +55,24 @@ pub fn build_public_stop_liquidity_position_instruction(
         .unwrap()
         .remove(0)
 }
+
+pub async fn execute_stop_position(
+    program: &Program<Arc<Keypair>>,
+    market_id: u64,
+    reference_index: u64,
+    signer: Arc<Keypair>,
+) -> anyhow::Result<()> {
+    println!("🚨🚨🚨🚨 Position has accumulated debt. Stopping position.");
+
+    let args = args::PublicStopLiquidityPosition { reference_index };
+    let ix = build_public_stop_liquidity_position_instruction(program, market_id, args);
+
+    program
+        .request()
+        .instruction(ix)
+        .signer(signer)
+        .send()
+        .await?;
+
+    Ok(())
+}

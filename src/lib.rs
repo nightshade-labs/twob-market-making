@@ -27,6 +27,19 @@ pub fn program_id() -> anchor_lang::prelude::Pubkey {
     TWOB_PROGRAM_ID.parse().expect("Invalid program ID")
 }
 
+pub async fn get_token_program_id(
+    program: &Program<Arc<Keypair>>,
+    mint: &Pubkey,
+) -> anyhow::Result<Pubkey> {
+    let account = program
+        .rpc()
+        .get_account(mint)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch mint account: {}", e))?;
+
+    Ok(account.owner)
+}
+
 pub struct LiquidityPositionBalances {
     pub base_balance: u64,
     pub quote_balance: u64,

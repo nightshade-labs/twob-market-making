@@ -5,9 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use anchor_client::{
     Client,
-    solana_sdk::{
-        commitment_config::CommitmentConfig, signature::read_keypair_file, signer::Signer,
-    },
+    solana_sdk::{commitment_config::CommitmentConfig, signer::Signer},
 };
 use config::{Config, DelayConfig};
 use position::{EvaluationResult, PositionAction, calculate_update_delay, evaluate_position};
@@ -24,21 +22,18 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let delay_config = DelayConfig::default();
 
-    let liquidity_provider = read_keypair_file(&config.keypair_path).map_err(|e| {
-        anyhow::anyhow!("Failed to read keypair from {}: {}", config.keypair_path, e)
-    })?;
-
-    let liquidity_provider = Arc::new(liquidity_provider);
+    let cluster = config.cluster();
+    let market_id = config.market_id;
+    let flow_divisor = config.flow_divisor;
+    let liquidity_provider = Arc::new(config.keypair);
     let client = Arc::new(Client::new_with_options(
-        config.cluster(),
+        cluster,
         liquidity_provider.clone(),
         CommitmentConfig::confirmed(),
     ));
 
     let program = client.program(twob_anchor::ID)?;
     let authority = liquidity_provider.pubkey();
-    let market_id = config.market_id;
-    let flow_divisor = config.flow_divisor;
 
     // Periodic update task
     // Keeps inventory balanced within acceptable bounds

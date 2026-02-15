@@ -7,9 +7,7 @@ use std::{sync::Arc, time::Duration};
 
 use anchor_client::{
     Client,
-    solana_sdk::{
-        commitment_config::CommitmentConfig, signature::read_keypair_file, signer::Signer,
-    },
+    solana_sdk::{commitment_config::CommitmentConfig, signer::Signer},
 };
 use config::Config;
 use price::fetch_price;
@@ -27,13 +25,14 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
 
-    let liquidity_provider = read_keypair_file(&config.keypair_path).map_err(|e| {
-        anyhow::anyhow!("Failed to read keypair from {}: {}", config.keypair_path, e)
-    })?;
-
-    let liquidity_provider = Arc::new(liquidity_provider);
+    let cluster = config.cluster();
+    let market_id = config.market_id;
+    let poll_interval = Duration::from_secs(config.poll_interval_secs);
+    let quote_threshold_bps = config.quote_threshold_bps;
+    let price_feed_url = config.price_feed_url;
+    let liquidity_provider = Arc::new(config.keypair);
     let client = Arc::new(Client::new_with_options(
-        config.cluster(),
+        cluster,
         liquidity_provider.clone(),
         CommitmentConfig::confirmed(),
     ));
@@ -41,13 +40,11 @@ async fn main() -> anyhow::Result<()> {
     let http_client = reqwest::Client::new();
     let program = client.program(twob_anchor::ID)?;
     let authority = liquidity_provider.pubkey();
-    let market_id = config.market_id;
-    let poll_interval = Duration::from_secs(config.poll_interval_secs);
 
     println!("Starting oracle-flow binary");
     println!("Market ID: {}", market_id);
-    println!("Poll interval: {}s", config.poll_interval_secs);
-    println!("Quote threshold: {} bps", config.quote_threshold_bps);
+    println!("Poll interval: {}s", poll_interval.as_secs());
+    println!("Quote threshold: {} bps", quote_threshold_bps);
 
     loop {
         tokio::select! {
@@ -59,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = run_update_cycle(
                     &program,
                     &http_client,
-                    &config,
+                    &price_feed_url,
+                    quote_threshold_bps,
                     market_id,
                     &authority,
                     liquidity_provider.clone(),
@@ -76,13 +74,14 @@ async fn main() -> anyhow::Result<()> {
 async fn run_update_cycle(
     program: &anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>,
     http_client: &reqwest::Client,
-    config: &Config,
+    price_feed_url: &str,
+    quote_threshold_bps: u64,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
 ) -> anyhow::Result<()> {
     // 1. Fetch external price
-    let price_data = fetch_price(http_client, &config.price_feed_url).await?;
+    let price_data = fetch_price(http_client, price_feed_url).await?;
     println!("Fetched price: {}", price_data.price);
 
     // 2. Fetch liquidity position and market state
@@ -135,7 +134,7 @@ async fn run_update_cycle(
         current_base_flow,
         current_quote_flow,
         &optimal,
-        config.quote_threshold_bps,
+        quote_threshold_bps,
     ) {
         println!(
             "Quote deviation exceeds threshold. Updating flows: base={} quote={}",

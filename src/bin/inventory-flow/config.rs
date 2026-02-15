@@ -1,9 +1,9 @@
 use std::env;
 
-use anchor_client::Cluster;
+use anchor_client::{Cluster, solana_sdk::signature::Keypair};
 
 pub struct Config {
-    pub keypair_path: String,
+    pub keypair: Keypair,
     pub rpc_url: String,
     pub ws_url: String,
     pub market_id: u64,
@@ -34,8 +34,11 @@ impl Default for DelayConfig {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let keypair_path = env::var("KEYPAIR_PATH")
-            .unwrap_or_else(|_| "Users/thgehr/.config/solana/id.json".to_string());
+        let keypair_bytes: Vec<u8> = serde_json::from_str(
+            &env::var("KEYPAIR").map_err(|_| anyhow::anyhow!("KEYPAIR env var not set"))?,
+        )?;
+        let keypair = Keypair::try_from(keypair_bytes.as_slice())
+            .map_err(|e| anyhow::anyhow!("Invalid keypair: {}", e))?;
 
         let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
 
@@ -50,7 +53,7 @@ impl Config {
             .parse::<u64>()?;
 
         Ok(Self {
-            keypair_path,
+            keypair,
             rpc_url,
             ws_url,
             market_id,

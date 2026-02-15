@@ -5446,6 +5446,7 @@ dependencies = [
  "dotenv",
  "reqwest",
  "serde",
+ "serde_json",
  "solana-rpc-client-types",
  "tokio",
 ]

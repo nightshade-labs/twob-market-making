@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("Failed to evaluate position: {}", e),
             }
 
-            sleep(Duration::from_mins(5)).await;
+            sleep(Duration::from_secs(5 * 60)).await;
         }
     });
 

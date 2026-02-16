@@ -29,6 +29,9 @@ async fn main() -> anyhow::Result<()> {
     let market_id = config.market_id;
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let quote_threshold_bps = config.quote_threshold_bps;
+    let rebalance_threshold_bps = config.rebalance_threshold_bps;
+    let base_token_decimals = config.base_token_decimals;
+    let quote_token_decimals = config.quote_token_decimals;
     let price_feed_url = config.price_feed_url;
     let liquidity_provider = Arc::new(config.keypair);
     let client = Arc::new(Client::new_with_options(
@@ -44,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting oracle-flow binary");
     println!("Market ID: {}", market_id);
     println!("Poll interval: {}s", poll_interval.as_secs());
+    println!("Rebalance threshold: {} bps", rebalance_threshold_bps);
     println!("Quote threshold: {} bps", quote_threshold_bps);
 
     loop {
@@ -58,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
                     &http_client,
                     &price_feed_url,
                     quote_threshold_bps,
+                    rebalance_threshold_bps,
+                    base_token_decimals,
+                    quote_token_decimals,
                     market_id,
                     &authority,
                     liquidity_provider.clone(),
@@ -76,6 +83,9 @@ async fn run_update_cycle(
     http_client: &reqwest::Client,
     price_feed_url: &str,
     quote_threshold_bps: u64,
+    rebalance_threshold_bps: u64,
+    base_token_decimals: u8,
+    quote_token_decimals: u8,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
@@ -96,8 +106,18 @@ async fn run_update_cycle(
     )
     .await;
 
+    println!("Market state {:?}", market_state.market);
+    println!("Position {:?}", position);
+    println!("Balances {:?}", balances.base_balance);
+
     // 3. Check if rebalance is needed
-    if needs_rebalance(&price_data, &balances, &market_state) {
+    if needs_rebalance(
+        &price_data,
+        &balances,
+        base_token_decimals,
+        quote_token_decimals,
+        rebalance_threshold_bps,
+    ) {
         println!("Inventory rebalance needed");
         execute_rebalance(
             program,

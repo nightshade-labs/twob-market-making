@@ -8,7 +8,10 @@ pub struct Config {
     pub ws_url: String,
     pub market_id: u64,
     pub price_feed_url: String,
+    pub base_token_decimals: u8,
+    pub quote_token_decimals: u8,
     pub poll_interval_secs: u64,
+    pub rebalance_threshold_bps: u64,
     pub quote_threshold_bps: u64,
 }
 
@@ -42,8 +45,20 @@ impl Config {
             )
         });
 
+        let base_token_decimals = env::var("BASE_TOKEN_DECIMALS")
+            .unwrap_or_else(|_| "9".to_string())
+            .parse::<u8>()?;
+
+        let quote_token_decimals = env::var("QUOTE_TOKEN_DECIMALS")
+            .unwrap_or_else(|_| "6".to_string())
+            .parse::<u8>()?;
+
         let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
             .unwrap_or_else(|_| "5".to_string())
+            .parse::<u64>()?;
+
+        let rebalance_threshold_bps = env::var("REBALANCE_THRESHOLD_BPS")
+            .unwrap_or_else(|_| "100".to_string())
             .parse::<u64>()?;
 
         let quote_threshold_bps = env::var("QUOTE_THRESHOLD_BPS")
@@ -56,7 +71,10 @@ impl Config {
             ws_url,
             market_id,
             price_feed_url,
+            base_token_decimals,
+            quote_token_decimals,
             poll_interval_secs,
+            rebalance_threshold_bps,
             quote_threshold_bps,
         })
     }

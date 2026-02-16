@@ -28,8 +28,19 @@ impl Config {
             .unwrap_or_else(|_| "1".to_string())
             .parse::<u64>()?;
 
-        let price_feed_url = env::var("PRICE_FEED_URL")
-            .unwrap_or_else(|_| "http://localhost:8080/price".to_string());
+        let price_feed_url = env::var("PRICE_FEED_URL").unwrap_or_else(|_| {
+            let base_url = env::var("PRICE_FEED_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:8080/api/v1/price".to_string());
+            let base_token = env::var("BASE_TOKEN").unwrap_or_else(|_| "SOL".to_string());
+            let quote_token = env::var("QUOTE_TOKEN").unwrap_or_else(|_| "USDC".to_string());
+
+            format!(
+                "{}/{}/{}",
+                base_url.trim_end_matches('/'),
+                base_token.trim(),
+                quote_token.trim(),
+            )
+        });
 
         let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
             .unwrap_or_else(|_| "5".to_string())

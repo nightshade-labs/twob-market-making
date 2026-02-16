@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let rebalance_threshold_bps = config.rebalance_threshold_bps;
     let base_token_decimals = config.base_token_decimals;
     let quote_token_decimals = config.quote_token_decimals;
+    let optimal_quote_weight = config.optimal_quote_weight;
     let price_feed_url = config.price_feed_url;
     let liquidity_provider = Arc::new(config.keypair);
     let client = Arc::new(Client::new_with_options(
@@ -49,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Poll interval: {}s", poll_interval.as_secs());
     println!("Rebalance threshold: {} bps", rebalance_threshold_bps);
     println!("Quote threshold: {} bps", quote_threshold_bps);
+    println!("Optimal quote weight: {}", optimal_quote_weight);
 
     loop {
         tokio::select! {
@@ -65,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
                     rebalance_threshold_bps,
                     base_token_decimals,
                     quote_token_decimals,
+                    optimal_quote_weight,
                     market_id,
                     &authority,
                     liquidity_provider.clone(),
@@ -86,6 +89,7 @@ async fn run_update_cycle(
     rebalance_threshold_bps: u64,
     base_token_decimals: u8,
     quote_token_decimals: u8,
+    optimal_quote_weight: f64,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
@@ -143,7 +147,15 @@ async fn run_update_cycle(
     }
 
     // 4. Calculate optimal quote
-    let optimal = calculate_optimal_quote(&price_data, &position, &market_state, &balances);
+    let optimal = calculate_optimal_quote(
+        &price_data,
+        &position,
+        &market_state,
+        &balances,
+        base_token_decimals,
+        quote_token_decimals,
+        optimal_quote_weight,
+    );
 
     // 4. Get current quote from position
     let current_base_flow = position.base_flow_u64;

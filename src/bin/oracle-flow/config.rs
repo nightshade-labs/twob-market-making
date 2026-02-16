@@ -10,6 +10,7 @@ pub struct Config {
     pub price_feed_url: String,
     pub base_token_decimals: u8,
     pub quote_token_decimals: u8,
+    pub optimal_quote_weight: f64,
     pub poll_interval_secs: u64,
     pub rebalance_threshold_bps: u64,
     pub quote_threshold_bps: u64,
@@ -53,6 +54,10 @@ impl Config {
             .unwrap_or_else(|_| "6".to_string())
             .parse::<u8>()?;
 
+        let optimal_quote_weight = env::var("OPTIMAL_QUOTE_WEIGHT")
+            .unwrap_or_else(|_| "0.1".to_string())
+            .parse::<f64>()?;
+
         let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
             .unwrap_or_else(|_| "5".to_string())
             .parse::<u64>()?;
@@ -73,6 +78,7 @@ impl Config {
             price_feed_url,
             base_token_decimals,
             quote_token_decimals,
+            optimal_quote_weight,
             poll_interval_secs,
             rebalance_threshold_bps,
             quote_threshold_bps,

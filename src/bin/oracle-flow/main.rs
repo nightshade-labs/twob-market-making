@@ -173,8 +173,9 @@ async fn run_update_cycle(
             optimal.base_flow, optimal.quote_flow
         );
 
-        let reference_index =
-            market_state.current_slot / ARRAY_LENGTH / market_state.market.end_slot_interval;
+        let reference_index = (market_state.current_slot + ARRAY_LENGTH / 2)
+            / ARRAY_LENGTH
+            / market_state.market.end_slot_interval;
 
         execute_update_flows(
             program,

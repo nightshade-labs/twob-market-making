@@ -18,6 +18,8 @@ struct PriceResponse {
 
 pub async fn fetch_price(client: &reqwest::Client, url: &str) -> anyhow::Result<PriceData> {
     println!("Fetching price feed from {}", url);
+    let test = client.get(url).send().await;
+    println!("REsponse {:?}", test);
     let response: PriceResponse = client.get(url).send().await?.json().await?;
 
     let price = parse_price(&response.price)?;

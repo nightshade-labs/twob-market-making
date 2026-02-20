@@ -14,7 +14,10 @@ pub fn needs_rebalance(
     threshold_bps: u64,
 ) -> bool {
     if price.price <= 0.0 {
-        eprintln!("Oracle price is non-positive ({}), skipping rebalance", price.price);
+        eprintln!(
+            "Oracle price is non-positive ({}), skipping rebalance",
+            price.price
+        );
         return false;
     }
 
@@ -22,10 +25,8 @@ pub fn needs_rebalance(
         return true;
     }
 
-    let base_ui =
-        balances.base_balance as f64 / 10f64.powi(i32::from(base_token_decimals));
-    let quote_ui =
-        balances.quote_balance as f64 / 10f64.powi(i32::from(quote_token_decimals));
+    let base_ui = balances.base_balance as f64 / 10f64.powi(i32::from(base_token_decimals));
+    let quote_ui = balances.quote_balance as f64 / 10f64.powi(i32::from(quote_token_decimals));
 
     if base_ui <= 0.0 || quote_ui <= 0.0 {
         return true;

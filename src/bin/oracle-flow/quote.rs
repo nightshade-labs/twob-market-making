@@ -152,7 +152,8 @@ fn market_price_excluding_position(
     let own_base_flow = position.base_flow_u64 as u128 * FLOW_PRECISION;
     let own_quote_flow = position.quote_flow_u64 as u128 * FLOW_PRECISION;
 
-    if market_state.market.base_flow <= own_base_flow || market_state.market.quote_flow <= own_quote_flow
+    if market_state.market.base_flow <= own_base_flow
+        || market_state.market.quote_flow <= own_quote_flow
     {
         return None;
     }

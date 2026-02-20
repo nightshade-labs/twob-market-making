@@ -28,10 +28,7 @@ pub async fn fetch_price(client: &reqwest::Client, url: &str) -> anyhow::Result<
         unix_now()
     });
 
-    Ok(PriceData {
-        price,
-        timestamp,
-    })
+    Ok(PriceData { price, timestamp })
 }
 
 fn parse_price(raw: &Value) -> anyhow::Result<f64> {
@@ -114,7 +111,8 @@ mod tests {
         let response: PriceResponse =
             serde_json::from_value(payload).expect("payload should deserialize");
         let price = parse_price(&response.price).expect("price should parse");
-        let timestamp = parse_timestamp(response.timestamp.as_ref()).expect("timestamp should parse");
+        let timestamp =
+            parse_timestamp(response.timestamp.as_ref()).expect("timestamp should parse");
 
         assert!((price - 84.0181294070247).abs() < 1e-9);
         assert_eq!(timestamp, 1_771_253_881);
@@ -130,7 +128,8 @@ mod tests {
         let response: PriceResponse =
             serde_json::from_value(payload).expect("payload should deserialize");
         let price = parse_price(&response.price).expect("price should parse");
-        let timestamp = parse_timestamp(response.timestamp.as_ref()).expect("timestamp should parse");
+        let timestamp =
+            parse_timestamp(response.timestamp.as_ref()).expect("timestamp should parse");
 
         assert_eq!(price, 42.5);
         assert_eq!(timestamp, 1_771_255_481);

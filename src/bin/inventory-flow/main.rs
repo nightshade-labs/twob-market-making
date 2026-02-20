@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         CommitmentConfig::confirmed(),
     ));
 
-    let program = client.program(twob_anchor::ID)?;
+    let mut subscription_program = client.program(twob_anchor::ID)?;
     let authority = liquidity_provider.pubkey();
 
     // Periodic update task
@@ -96,11 +96,13 @@ async fn main() -> anyhow::Result<()> {
     // Event-driven updates
     // Recalculates update timing when market state changes
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let _unsubscriber = program
-        .on(move |ctx, event: MarketUpdateEvent| {
-            let _ = tx.send((ctx.signature, ctx.slot, event));
-        })
-        .await?;
+    let mut event_unsubscriber = Some(
+        subscription_program
+            .on(move |ctx, event: MarketUpdateEvent| {
+                let _ = tx.send((ctx.signature, ctx.slot, event));
+            })
+            .await?,
+    );
 
     let mut current_task: Option<JoinHandle<()>> = None;
 
@@ -120,8 +122,47 @@ async fn main() -> anyhow::Result<()> {
             }
             event = rx.recv() => {
                 let Some(_event) = event else {
-                    println!("Event channel closed");
-                    break;
+                    println!("Event channel closed; attempting to resubscribe");
+
+                    if let Some(handle) = current_task.take() {
+                        handle.abort();
+                    }
+
+                    if let Some(unsubscriber) = event_unsubscriber.take() {
+                        drop(unsubscriber);
+                    }
+
+                    loop {
+                        subscription_program = match client.program(twob_anchor::ID) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("Failed to get program client for resubscribe: {}", e);
+                                sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+
+                        let (new_tx, new_rx) = mpsc::unbounded_channel();
+                        match subscription_program
+                            .on(move |ctx, event: MarketUpdateEvent| {
+                                let _ = new_tx.send((ctx.signature, ctx.slot, event));
+                            })
+                            .await
+                        {
+                            Ok(unsubscriber) => {
+                                rx = new_rx;
+                                event_unsubscriber = Some(unsubscriber);
+                                println!("Resubscribed to market updates");
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to resubscribe to market updates: {}", e);
+                                sleep(Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+
+                    continue;
                 };
 
                 if let Some(handle) = current_task.take() {
@@ -131,7 +172,13 @@ async fn main() -> anyhow::Result<()> {
                 let client = client.clone();
                 let lp = liquidity_provider.clone();
 
-                let program = client.program(twob_anchor::ID)?;
+                let program = match client.program(twob_anchor::ID) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Failed to get program client: {}", e);
+                        continue;
+                    }
+                };
 
                 match evaluate_position(&program, market_id, &authority, flow_divisor).await {
                     Ok(result) => match result.action {

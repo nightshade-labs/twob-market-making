@@ -60,6 +60,14 @@ pub async fn get_liquidity_position_balances(
         bookkeeping.slots_without_trade - liquidity_position.slots_without_trade_snapshot;
 
     // For debugging since sometimes it failed because substraction overflow
+    println!(
+        "Base balances {:?} | Base debt {:?} | Quote balances {:?} | Quote debt {:?}",
+        liquidity_position.base_balance,
+        liquidity_position.base_debt,
+        liquidity_position.quote_balance,
+        liquidity_position.quote_debt
+    );
+
     println!("Current slot {}", current_slot);
     println!(
         "LP last update slot {}",

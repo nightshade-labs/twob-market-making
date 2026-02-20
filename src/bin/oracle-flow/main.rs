@@ -116,7 +116,6 @@ async fn run_update_cycle(
 
     println!("Market state {:?}", market_state.market);
     println!("Position {:?}", position);
-    println!("Balances {:?}", balances.base_balance);
 
     // 3. Check if rebalance is needed
     if needs_rebalance(

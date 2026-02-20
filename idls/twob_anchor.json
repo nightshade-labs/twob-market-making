@@ -5190,6 +5190,14 @@
             "type": "u64"
           },
           {
+            "name": "start_slot",
+            "type": "u64"
+          },
+          {
+            "name": "end_slot",
+            "type": "u64"
+          },
+          {
             "name": "deposit_amount",
             "type": "u64"
           },

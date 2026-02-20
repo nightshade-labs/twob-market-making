@@ -2777,7 +2777,8 @@
           "writable": true
         },
         {
-          "name": "future_prices"
+          "name": "future_prices",
+          "writable": true
         },
         {
           "name": "current_exits"

@@ -92,29 +92,18 @@ pub fn should_update_quote(
     optimal: &OptimalQuote,
     threshold_bps: u64,
 ) -> bool {
-    if current_base_flow == 0 || current_quote_flow == 0 {
-        return optimal.base_flow > 0 && optimal.quote_flow > 0;
-    }
-
-    if optimal.base_flow == 0 || optimal.quote_flow == 0 {
+    if current_base_flow == optimal.base_flow && current_quote_flow == optimal.quote_flow {
         return false;
     }
 
-    // Compare ratios: current_base/current_quote vs optimal_base/optimal_quote
-    // Using cross multiplication to avoid floating point: a/b vs c/d => a*d vs b*c
-    let current_ratio = current_base_flow as u128 * optimal.quote_flow as u128;
-    let optimal_ratio = optimal.base_flow as u128 * current_quote_flow as u128;
+    if optimal.base_flow == 0 || optimal.quote_flow == 0 {
+        return current_base_flow != optimal.base_flow || current_quote_flow != optimal.quote_flow;
+    }
 
-    let (larger, smaller) = if current_ratio > optimal_ratio {
-        (current_ratio, optimal_ratio)
-    } else {
-        (optimal_ratio, current_ratio)
-    };
+    let base_deviation_bps = flow_deviation_bps(current_base_flow, optimal.base_flow);
+    let quote_deviation_bps = flow_deviation_bps(current_quote_flow, optimal.quote_flow);
 
-    // deviation_bps = (larger - smaller) * 10000 / smaller
-    let deviation_bps = (larger - smaller) * 10_000 / smaller;
-
-    deviation_bps > threshold_bps as u128
+    base_deviation_bps > threshold_bps as u128 || quote_deviation_bps > threshold_bps as u128
 }
 
 fn sanitize_weight(weight: f64) -> f64 {
@@ -123,6 +112,20 @@ fn sanitize_weight(weight: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn flow_deviation_bps(current: u64, target: u64) -> u128 {
+    if target == 0 {
+        return if current == 0 { 0 } else { u128::MAX };
+    }
+
+    let (larger, smaller) = if current >= target {
+        (current as u128, target as u128)
+    } else {
+        (target as u128, current as u128)
+    };
+
+    (larger - smaller) * 10_000 / target as u128
 }
 
 fn liquidity_position_price(
@@ -345,5 +348,58 @@ mod tests {
         let optimal = compute_target_flows(&balances, 99.0, 100.0, 9, 6).unwrap();
         assert_eq!(optimal.base_flow, 1_000_000_000);
         assert_eq!(optimal.quote_flow, 99_000_000);
+    }
+
+    #[test]
+    fn should_not_update_when_flows_match() {
+        let optimal = OptimalQuote {
+            base_flow: 1_000_000_000,
+            quote_flow: 100_000_000,
+        };
+
+        assert!(!should_update_quote(
+            1_000_000_000,
+            100_000_000,
+            &optimal,
+            50
+        ));
+    }
+
+    #[test]
+    fn should_update_when_size_deviates_even_if_ratio_matches() {
+        let optimal = OptimalQuote {
+            base_flow: 1_000_000_000,
+            quote_flow: 100_000_000,
+        };
+
+        // Same ratio (10x both flows), but materially different absolute flows.
+        assert!(should_update_quote(
+            10_000_000_000,
+            1_000_000_000,
+            &optimal,
+            50
+        ));
+    }
+
+    #[test]
+    fn should_respect_threshold_for_small_size_deviation() {
+        let optimal = OptimalQuote {
+            base_flow: 1_000_000_000,
+            quote_flow: 100_000_000,
+        };
+
+        // 0.3% deviation on base and quote => 30 bps.
+        assert!(!should_update_quote(
+            1_003_000_000,
+            100_300_000,
+            &optimal,
+            50
+        ));
+        assert!(should_update_quote(
+            1_003_000_000,
+            100_300_000,
+            &optimal,
+            20
+        ));
     }
 }

@@ -52,7 +52,13 @@ pub async fn execute_rebalance(
     _price: &PriceData,
     _balances: &LiquidityPositionBalances,
     _liquidity_provider: Arc<Keypair>,
+    is_devnet: bool,
 ) -> anyhow::Result<()> {
+    if is_devnet {
+        println!("Devnet detected. Skipping execute_rebalance (no-op).");
+        return Ok(());
+    }
+
     anyhow::bail!("execute_rebalance is not implemented yet")
 }
 

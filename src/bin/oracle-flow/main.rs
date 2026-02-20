@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let base_token_decimals = config.base_token_decimals;
     let quote_token_decimals = config.quote_token_decimals;
     let optimal_quote_weight = config.optimal_quote_weight;
+    let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
     let liquidity_provider = Arc::new(config.keypair);
     let client = Arc::new(Client::new_with_options(
@@ -51,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Rebalance threshold: {} bps", rebalance_threshold_bps);
     println!("Quote threshold: {} bps", quote_threshold_bps);
     println!("Optimal quote weight: {}", optimal_quote_weight);
+    println!("Devnet mode: {}", is_devnet);
 
     loop {
         tokio::select! {
@@ -68,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
                     base_token_decimals,
                     quote_token_decimals,
                     optimal_quote_weight,
+                    is_devnet,
                     market_id,
                     &authority,
                     liquidity_provider.clone(),
@@ -90,6 +93,7 @@ async fn run_update_cycle(
     base_token_decimals: u8,
     quote_token_decimals: u8,
     optimal_quote_weight: f64,
+    is_devnet: bool,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
@@ -129,6 +133,7 @@ async fn run_update_cycle(
             &price_data,
             &balances,
             liquidity_provider.clone(),
+            is_devnet,
         )
         .await?;
 

@@ -19,7 +19,8 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let keypair_bytes: Vec<u8> = serde_json::from_str(
-            &env::var("KEYPAIR").map_err(|_| anyhow::anyhow!("KEYPAIR env var not set"))?,
+            &env::var("ORACLE_FLOW_KEYPAIR")
+                .map_err(|_| anyhow::anyhow!("KEYPAIR env var not set"))?,
         )?;
         let keypair = Keypair::try_from(keypair_bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("Invalid keypair: {}", e))?;

@@ -15,9 +15,13 @@ use quote::{calculate_optimal_quote, should_update_quote};
 use rebalance::{execute_rebalance, needs_rebalance};
 use tokio::{signal, time::sleep};
 use twob_market_making::{
-    ARRAY_LENGTH, execute_update_flows, fetch_liquidity_position, fetch_market_state,
-    get_liquidity_position_balances, twob_anchor,
+    ARRAY_LENGTH, build_update_liquidity_flows_instruction, execute_update_flows,
+    fetch_liquidity_position, fetch_market_state, get_liquidity_position_balances, twob_anchor,
 };
+
+const FLOW_REDUCTION_FACTOR: f64 = 0.99;
+const MAX_FLOW_REDUCTION_ATTEMPTS: usize = 200;
+const LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE: u32 = 6013;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -181,7 +185,7 @@ async fn run_update_cycle(
             / ARRAY_LENGTH
             / market_state.market.end_slot_interval;
 
-        execute_update_flows(
+        let (final_base_flow, final_quote_flow) = execute_update_flows_with_backoff(
             program,
             market_id,
             optimal.base_flow,
@@ -191,10 +195,146 @@ async fn run_update_cycle(
         )
         .await?;
 
-        println!("Flows updated successfully");
+        println!(
+            "Flows updated successfully with final values: base={} quote={}",
+            final_base_flow, final_quote_flow
+        );
     } else {
         println!("Quote within threshold, no update needed");
     }
 
     Ok(())
+}
+
+async fn execute_update_flows_with_backoff(
+    program: &anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>,
+    market_id: u64,
+    base_flow: u64,
+    quote_flow: u64,
+    reference_index: u64,
+    signer: Arc<anchor_client::solana_sdk::signature::Keypair>,
+) -> anyhow::Result<(u64, u64)> {
+    let mut candidate_base_flow = base_flow.max(1);
+    let mut candidate_quote_flow = quote_flow.max(1);
+
+    for attempt in 0..MAX_FLOW_REDUCTION_ATTEMPTS {
+        let ix = build_update_liquidity_flows_instruction(
+            program,
+            market_id,
+            twob_anchor::client::args::UpdateLiquidityFlows {
+                reference_index,
+                base_flow_u64: candidate_base_flow,
+                quote_flow_u64: candidate_quote_flow,
+            },
+        );
+
+        let signed_tx = program
+            .request()
+            .instruction(ix)
+            .signer(signer.clone())
+            .signed_transaction()
+            .await?;
+
+        let simulation = program.rpc().simulate_transaction(&signed_tx).await?;
+        if simulation.value.err.is_none() {
+            execute_update_flows(
+                program,
+                market_id,
+                candidate_base_flow,
+                candidate_quote_flow,
+                reference_index,
+                signer,
+            )
+            .await?;
+            return Ok((candidate_base_flow, candidate_quote_flow));
+        }
+
+        let err = &simulation.value.err;
+        let logs = simulation.value.logs.as_deref();
+        if is_liquidity_position_unhealthy(err, logs) {
+            let next_base_flow = reduce_flow(candidate_base_flow, FLOW_REDUCTION_FACTOR);
+            let next_quote_flow = reduce_flow(candidate_quote_flow, FLOW_REDUCTION_FACTOR);
+
+            println!(
+                "Simulation failed with LiquidityPositionUnhealthy on attempt {}. Reducing flows: base {} -> {}, quote {} -> {}",
+                attempt + 1,
+                candidate_base_flow,
+                next_base_flow,
+                candidate_quote_flow,
+                next_quote_flow
+            );
+
+            if next_base_flow == candidate_base_flow && next_quote_flow == candidate_quote_flow {
+                anyhow::bail!(
+                    "Unable to reduce flows further after LiquidityPositionUnhealthy. Last attempted flows: base={}, quote={}",
+                    candidate_base_flow,
+                    candidate_quote_flow
+                );
+            }
+
+            candidate_base_flow = next_base_flow;
+            candidate_quote_flow = next_quote_flow;
+            continue;
+        }
+
+        anyhow::bail!(
+            "Update-flows simulation failed with non-retriable error. err={:?} logs={:?}",
+            err,
+            logs
+        );
+    }
+
+    anyhow::bail!(
+        "Failed to find healthy flows after {} attempts. Last attempted base={} quote={}",
+        MAX_FLOW_REDUCTION_ATTEMPTS,
+        candidate_base_flow,
+        candidate_quote_flow
+    )
+}
+
+fn is_liquidity_position_unhealthy(
+    err: &Option<anchor_client::solana_sdk::transaction::TransactionError>,
+    logs: Option<&[String]>,
+) -> bool {
+    let code_match = matches!(
+        err,
+        Some(anchor_client::solana_sdk::transaction::TransactionError::InstructionError(
+            _,
+            anchor_client::solana_sdk::instruction::InstructionError::Custom(code)
+        )) if *code == LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE
+    );
+
+    if code_match {
+        return true;
+    }
+
+    logs.map(|entries| {
+        entries.iter().any(|line| {
+            line.contains("LiquidityPositionUnhealthy")
+                || line.contains("Liquidity position is unhealthy")
+                || line.contains("custom program error: 0x177d")
+        })
+    })
+    .unwrap_or(false)
+}
+
+fn reduce_flow(flow: u64, factor: f64) -> u64 {
+    if flow <= 1 {
+        return flow;
+    }
+
+    let reduced = ((flow as f64) * factor).floor() as u64;
+    reduced.clamp(1, flow - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduce_flow_always_makes_progress_when_possible() {
+        assert_eq!(reduce_flow(100, 0.99), 99);
+        assert_eq!(reduce_flow(2, 0.99), 1);
+        assert_eq!(reduce_flow(1, 0.99), 1);
+    }
 }

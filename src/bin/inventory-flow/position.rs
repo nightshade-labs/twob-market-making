@@ -36,6 +36,8 @@ pub async fn evaluate_position(
     let market_state = fetch_market_state(program, market_id).await?;
     let position = fetch_liquidity_position(program, market_id, authority).await?;
 
+    println!("Liquidity position {:?}", position);
+
     let reference_index =
         market_state.current_slot / ARRAY_LENGTH / market_state.market.end_slot_interval;
 

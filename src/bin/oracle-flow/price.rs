@@ -6,6 +6,7 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub struct PriceData {
     pub price: f64,
+    #[allow(dead_code)]
     pub timestamp: u64,
 }
 

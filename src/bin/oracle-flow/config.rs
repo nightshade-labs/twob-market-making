@@ -14,6 +14,8 @@ pub struct Config {
     pub poll_interval_secs: u64,
     pub rebalance_threshold_bps: u64,
     pub quote_threshold_bps: u64,
+    pub flow_reduction_factor: f64,
+    pub max_flow_reduction_attempts: usize,
 }
 
 impl Config {
@@ -71,6 +73,14 @@ impl Config {
             .unwrap_or_else(|_| "50".to_string())
             .parse::<u64>()?;
 
+        let flow_reduction_factor = env::var("FLOW_REDUCTION_FACTOR")
+            .unwrap_or_else(|_| "0.99".to_string())
+            .parse::<f64>()?;
+
+        let max_flow_reduction_attempts = env::var("MAX_FLOW_REDUCTION_ATTEMPTS")
+            .unwrap_or_else(|_| "200".to_string())
+            .parse::<usize>()?;
+
         Ok(Self {
             keypair,
             rpc_url,
@@ -83,6 +93,8 @@ impl Config {
             poll_interval_secs,
             rebalance_threshold_bps,
             quote_threshold_bps,
+            flow_reduction_factor,
+            max_flow_reduction_attempts,
         })
     }
 

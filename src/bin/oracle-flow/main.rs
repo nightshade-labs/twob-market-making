@@ -19,8 +19,6 @@ use twob_market_making::{
     fetch_liquidity_position, fetch_market_state, get_liquidity_position_balances, twob_anchor,
 };
 
-const FLOW_REDUCTION_FACTOR: f64 = 0.99;
-const MAX_FLOW_REDUCTION_ATTEMPTS: usize = 200;
 const LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE: u32 = 6013;
 
 #[tokio::main]
@@ -37,6 +35,8 @@ async fn main() -> anyhow::Result<()> {
     let base_token_decimals = config.base_token_decimals;
     let quote_token_decimals = config.quote_token_decimals;
     let optimal_quote_weight = config.optimal_quote_weight;
+    let flow_reduction_factor = config.flow_reduction_factor;
+    let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
     let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
     let liquidity_provider = Arc::new(config.keypair);
@@ -74,6 +74,8 @@ async fn main() -> anyhow::Result<()> {
                     base_token_decimals,
                     quote_token_decimals,
                     optimal_quote_weight,
+                    flow_reduction_factor,
+                    max_flow_reduction_attempts,
                     is_devnet,
                     market_id,
                     &authority,
@@ -97,6 +99,8 @@ async fn run_update_cycle(
     base_token_decimals: u8,
     quote_token_decimals: u8,
     optimal_quote_weight: f64,
+    flow_reduction_factor: f64,
+    max_flow_reduction_attempts: usize,
     is_devnet: bool,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
@@ -191,6 +195,8 @@ async fn run_update_cycle(
             optimal.base_flow,
             optimal.quote_flow,
             reference_index,
+            flow_reduction_factor,
+            max_flow_reduction_attempts,
             liquidity_provider,
         )
         .await?;
@@ -212,12 +218,14 @@ async fn execute_update_flows_with_backoff(
     base_flow: u64,
     quote_flow: u64,
     reference_index: u64,
+    flow_reduction_factor: f64,
+    max_flow_reduction_attempts: usize,
     signer: Arc<anchor_client::solana_sdk::signature::Keypair>,
 ) -> anyhow::Result<(u64, u64)> {
     let mut candidate_base_flow = base_flow.max(1);
     let mut candidate_quote_flow = quote_flow.max(1);
 
-    for attempt in 0..MAX_FLOW_REDUCTION_ATTEMPTS {
+    for attempt in 0..max_flow_reduction_attempts {
         let ix = build_update_liquidity_flows_instruction(
             program,
             market_id,
@@ -252,8 +260,8 @@ async fn execute_update_flows_with_backoff(
         let err = &simulation.value.err;
         let logs = simulation.value.logs.as_deref();
         if is_liquidity_position_unhealthy(err, logs) {
-            let next_base_flow = reduce_flow(candidate_base_flow, FLOW_REDUCTION_FACTOR);
-            let next_quote_flow = reduce_flow(candidate_quote_flow, FLOW_REDUCTION_FACTOR);
+            let next_base_flow = reduce_flow(candidate_base_flow, flow_reduction_factor);
+            let next_quote_flow = reduce_flow(candidate_quote_flow, flow_reduction_factor);
 
             println!(
                 "Simulation failed with LiquidityPositionUnhealthy on attempt {}. Reducing flows: base {} -> {}, quote {} -> {}",
@@ -286,7 +294,7 @@ async fn execute_update_flows_with_backoff(
 
     anyhow::bail!(
         "Failed to find healthy flows after {} attempts. Last attempted base={} quote={}",
-        MAX_FLOW_REDUCTION_ATTEMPTS,
+        max_flow_reduction_attempts,
         candidate_base_flow,
         candidate_quote_flow
     )

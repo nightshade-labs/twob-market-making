@@ -62,7 +62,7 @@ impl Config {
             .parse::<f64>()?;
 
         let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
-            .unwrap_or_else(|_| "5".to_string())
+            .unwrap_or_else(|_| "1".to_string())
             .parse::<u64>()?;
 
         let rebalance_threshold_bps = env::var("REBALANCE_THRESHOLD_BPS")

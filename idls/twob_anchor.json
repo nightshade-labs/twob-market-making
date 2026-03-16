@@ -4464,10 +4464,12 @@
           }
         },
         {
-          "name": "base_destination_token_account"
+          "name": "base_destination_token_account",
+          "writable": true
         },
         {
-          "name": "quote_destination_token_account"
+          "name": "quote_destination_token_account",
+          "writable": true
         },
         {
           "name": "base_token_program"

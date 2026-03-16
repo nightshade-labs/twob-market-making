@@ -5480,6 +5480,8 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "anyhow",
+ "base64 0.22.1",
+ "bincode",
  "chrono",
  "dotenv",
  "reqwest",

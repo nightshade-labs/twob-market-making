@@ -1,4 +1,5 @@
 mod config;
+mod jupiter;
 mod price;
 mod quote;
 mod rebalance;
@@ -9,10 +10,10 @@ use anchor_client::{
     Client,
     solana_sdk::{commitment_config::CommitmentConfig, signer::Signer},
 };
-use config::Config;
+use config::{Config, JupiterConfig};
 use price::fetch_price;
 use quote::{calculate_optimal_quote, should_update_quote};
-use rebalance::{execute_rebalance, needs_rebalance};
+use rebalance::{RebalanceOutcome, execute_rebalance, needs_rebalance};
 use tokio::{signal, time::sleep};
 use twob_market_making::{
     ARRAY_LENGTH, build_update_liquidity_flows_instruction, execute_update_flows,
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
     let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
+    let jupiter_config = config.jupiter.clone();
     let liquidity_provider = Arc::new(config.keypair);
     let client = Arc::new(Client::new_with_options(
         cluster,
@@ -56,6 +58,11 @@ async fn main() -> anyhow::Result<()> {
     println!("Rebalance threshold: {} bps", rebalance_threshold_bps);
     println!("Quote threshold: {} bps", quote_threshold_bps);
     println!("Optimal quote weight: {}", optimal_quote_weight);
+    println!(
+        "Jupiter API key configured: {}",
+        jupiter_config.api_key.is_some()
+    );
+    println!("Jupiter dry run: {}", jupiter_config.dry_run);
     println!("Devnet mode: {}", is_devnet);
 
     loop {
@@ -76,12 +83,13 @@ async fn main() -> anyhow::Result<()> {
                     optimal_quote_weight,
                     flow_reduction_factor,
                     max_flow_reduction_attempts,
+                    &jupiter_config,
                     is_devnet,
                     market_id,
                     &authority,
                     liquidity_provider.clone(),
                 ).await {
-                    eprintln!("Update cycle error: {}", e);
+                    eprintln!("Update cycle error: {:#}", e);
                 }
             }
         }
@@ -90,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_update_cycle(
     program: &anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>,
     http_client: &reqwest::Client,
@@ -101,6 +110,7 @@ async fn run_update_cycle(
     optimal_quote_weight: f64,
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
+    jupiter_config: &JupiterConfig,
     is_devnet: bool,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
@@ -134,28 +144,39 @@ async fn run_update_cycle(
         rebalance_threshold_bps,
     ) {
         println!("Inventory rebalance needed");
-        execute_rebalance(
+        let rebalance_outcome = execute_rebalance(
             program,
+            http_client,
             market_id,
+            &market_state,
             &price_data,
             &balances,
+            base_token_decimals,
+            quote_token_decimals,
+            position.base_flow_u64,
+            position.quote_flow_u64,
             liquidity_provider.clone(),
+            jupiter_config,
+            flow_reduction_factor,
+            max_flow_reduction_attempts,
             is_devnet,
         )
         .await?;
 
-        // Re-fetch position data after rebalance
-        market_state = fetch_market_state(program, market_id).await?;
-        position = fetch_liquidity_position(program, market_id, authority).await?;
-        balances = get_liquidity_position_balances(
-            program,
-            position,
-            market_state.bookkeeping,
-            market_state.market,
-            market_state.current_slot,
-        )
-        .await;
-        println!("Rebalance completed, position data refreshed");
+        if rebalance_outcome == RebalanceOutcome::Executed {
+            // Re-fetch position data after rebalance
+            market_state = fetch_market_state(program, market_id).await?;
+            position = fetch_liquidity_position(program, market_id, authority).await?;
+            balances = get_liquidity_position_balances(
+                program,
+                position,
+                market_state.bookkeeping,
+                market_state.market,
+                market_state.current_slot,
+            )
+            .await;
+            println!("Rebalance completed, position data refreshed");
+        }
     }
 
     // 4. Calculate optimal quote
@@ -212,6 +233,7 @@ async fn run_update_cycle(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_update_flows_with_backoff(
     program: &anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>,
     market_id: u64,

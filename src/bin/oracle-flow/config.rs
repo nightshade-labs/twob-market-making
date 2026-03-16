@@ -2,6 +2,15 @@ use std::env;
 
 use anchor_client::{Cluster, solana_sdk::signature::Keypair};
 
+#[derive(Clone, Debug)]
+pub struct JupiterConfig {
+    pub api_key: Option<String>,
+    pub ultra_api_base_url: String,
+    pub max_slippage_bps: u64,
+    pub max_price_impact_bps: u64,
+    pub dry_run: bool,
+}
+
 pub struct Config {
     pub keypair: Keypair,
     pub rpc_url: String,
@@ -16,6 +25,7 @@ pub struct Config {
     pub quote_threshold_bps: u64,
     pub flow_reduction_factor: f64,
     pub max_flow_reduction_attempts: usize,
+    pub jupiter: JupiterConfig,
 }
 
 impl Config {
@@ -81,6 +91,23 @@ impl Config {
             .unwrap_or_else(|_| "200".to_string())
             .parse::<usize>()?;
 
+        let jupiter = JupiterConfig {
+            api_key: env::var("JUPITER_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            ultra_api_base_url: env::var("JUPITER_ULTRA_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.jup.ag/ultra/v1".to_string()),
+            max_slippage_bps: env::var("JUPITER_MAX_SLIPPAGE_BPS")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse::<u64>()?,
+            max_price_impact_bps: env::var("JUPITER_MAX_PRICE_IMPACT_BPS")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse::<u64>()?,
+            dry_run: env::var("JUPITER_DRY_RUN")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()?,
+        };
+
         Ok(Self {
             keypair,
             rpc_url,
@@ -95,6 +122,7 @@ impl Config {
             quote_threshold_bps,
             flow_reduction_factor,
             max_flow_reduction_attempts,
+            jupiter,
         })
     }
 

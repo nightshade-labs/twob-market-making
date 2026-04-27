@@ -1,5 +1,5 @@
 {
-  "address": "twobmF9NrRYUA6AN1yTdnWYfEpCr9UXWpESTRPG1KJj",
+  "address": "CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5",
   "metadata": {
     "name": "twob_anchor",
     "version": "0.1.0",
@@ -5029,96 +5029,101 @@
     },
     {
       "code": 6003,
+      "name": "DepositTooSmall",
+      "msg": "Increase order size"
+    },
+    {
+      "code": 6004,
       "name": "FlowTooSmall",
       "msg": "Increase order size or reduce order duration"
     },
     {
-      "code": 6004,
+      "code": 6005,
       "name": "InvalidMint",
       "msg": "Invalid mint account"
     },
     {
-      "code": 6005,
+      "code": 6006,
       "name": "WrongExitsAccount",
       "msg": "Wrong exits account"
     },
     {
-      "code": 6006,
+      "code": 6007,
       "name": "WrongPricesAccount",
       "msg": "Wrong prices account"
     },
     {
-      "code": 6007,
+      "code": 6008,
       "name": "WrongTokenAccount",
       "msg": "Wrong token account"
     },
     {
-      "code": 6008,
+      "code": 6009,
       "name": "InvalidOrder",
       "msg": "Invalid order submission"
     },
     {
-      "code": 6009,
+      "code": 6010,
       "name": "BookNotUpToDate",
       "msg": "Book not up to date"
     },
     {
-      "code": 6010,
+      "code": 6011,
       "name": "PositionNotEnded",
       "msg": "Cannot close open position."
     },
     {
-      "code": 6011,
+      "code": 6012,
       "name": "NotEnoughDeposits",
       "msg": "Deposits are too low for specified flow."
     },
     {
-      "code": 6012,
+      "code": 6013,
       "name": "MinAmountOutNotReached",
       "msg": "Minimum amount out is not reached."
     },
     {
-      "code": 6013,
+      "code": 6014,
       "name": "LiquidityPositionUnhealthy",
       "msg": "Liquidity position is unhealthy."
     },
     {
-      "code": 6014,
+      "code": 6015,
       "name": "LiquidityPositionStillActive",
       "msg": "Liquidity position still active."
     },
     {
-      "code": 6015,
+      "code": 6016,
       "name": "LiquidityPositionNotActive",
       "msg": "Liquidity position not active anymore."
     },
     {
-      "code": 6016,
+      "code": 6017,
       "name": "NoDebt",
       "msg": "Liquidity position has no debt."
     },
     {
-      "code": 6017,
+      "code": 6018,
       "name": "MustCoverDebt",
       "msg": "Deposits must cover debt."
     },
     {
-      "code": 6018,
+      "code": 6019,
       "name": "MarketIsPaused",
       "msg": "Market is paused."
     },
     {
-      "code": 6019,
+      "code": 6020,
       "name": "RemainingOrders",
       "msg": "Market still has orders."
     },
     {
-      "code": 6020,
+      "code": 6021,
       "name": "AccountStillUsed",
       "msg": "Too early to close account."
     },
     {
-      "code": 6021,
+      "code": 6022,
       "name": "TradePositionExpired",
       "msg": "Too late to close position."
     }
@@ -5251,7 +5256,7 @@
             "type": {
               "array": [
                 "u128",
-                20
+                10
               ]
             }
           },
@@ -5263,9 +5268,16 @@
             "type": {
               "array": [
                 "u128",
-                20
+                10
               ]
             }
+          },
+          {
+            "name": "open_positions",
+            "docs": [
+              "Number of open trade positions that end in this reference interval"
+            ],
+            "type": "u64"
           },
           {
             "name": "index",
@@ -5501,7 +5513,7 @@
             "type": {
               "array": [
                 "u128",
-                20
+                10
               ]
             }
           },
@@ -5513,7 +5525,7 @@
             "type": {
               "array": [
                 "u128",
-                20
+                10
               ]
             }
           },
@@ -5525,7 +5537,7 @@
             "type": {
               "array": [
                 "u64",
-                20
+                10
               ]
             }
           },

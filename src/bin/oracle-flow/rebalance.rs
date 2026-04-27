@@ -454,6 +454,35 @@ fn plan_rebalance(
 
     let base_ui = balances.base_balance as f64 / 10f64.powi(i32::from(base_token_decimals));
     let quote_ui = balances.quote_balance as f64 / 10f64.powi(i32::from(quote_token_decimals));
+
+    // One side fully depleted: swap half of the available side to restore the missing one.
+    if balances.base_balance == 0 && balances.quote_balance > 0 {
+        let withdraw_quote_lamports = balances.quote_balance / 2;
+        println!(
+            "[rebalance] plan: base depleted — swapping half of quote to base \
+             (withdraw_quote={})",
+            withdraw_quote_lamports,
+        );
+        return Some(RebalancePlan {
+            direction: SwapDirection::QuoteToBase,
+            withdraw_base_lamports: 0,
+            withdraw_quote_lamports,
+        });
+    }
+    if balances.quote_balance == 0 && balances.base_balance > 0 {
+        let withdraw_base_lamports = balances.base_balance / 2;
+        println!(
+            "[rebalance] plan: quote depleted — swapping half of base to quote \
+             (withdraw_base={})",
+            withdraw_base_lamports,
+        );
+        return Some(RebalancePlan {
+            direction: SwapDirection::BaseToQuote,
+            withdraw_base_lamports,
+            withdraw_quote_lamports: 0,
+        });
+    }
+
     if !base_ui.is_finite() || !quote_ui.is_finite() || base_ui <= 0.0 || quote_ui <= 0.0 {
         println!(
             "[rebalance] plan: cannot plan — invalid UI amounts (base={} quote={})",
@@ -628,6 +657,36 @@ mod tests {
     }
 
     #[test]
+    fn plans_quote_to_base_when_base_is_fully_depleted() {
+        // base=0, quote=355_440_173 → should swap half the quote to base
+        let balances = sample_balances(0, 355_440_173);
+        let price = PriceData {
+            price: 84.0,
+            timestamp: 0,
+        };
+
+        let plan = plan_rebalance(&price, &balances, 9, 6).unwrap();
+        assert_eq!(plan.direction, SwapDirection::QuoteToBase);
+        assert_eq!(plan.withdraw_base_lamports, 0);
+        assert_eq!(plan.withdraw_quote_lamports, 177_720_086);
+    }
+
+    #[test]
+    fn plans_base_to_quote_when_quote_is_fully_depleted() {
+        // base=1_000_000_000, quote=0 → should swap half the base to quote
+        let balances = sample_balances(1_000_000_000, 0);
+        let price = PriceData {
+            price: 84.0,
+            timestamp: 0,
+        };
+
+        let plan = plan_rebalance(&price, &balances, 9, 6).unwrap();
+        assert_eq!(plan.direction, SwapDirection::BaseToQuote);
+        assert_eq!(plan.withdraw_base_lamports, 500_000_000);
+        assert_eq!(plan.withdraw_quote_lamports, 0);
+    }
+
+    #[test]
     fn returns_none_when_half_unused_inventory_rounds_to_zero() {
         let balances = sample_balances(1_000_000_000, 92_000_001);
         let price = PriceData {
@@ -648,7 +707,8 @@ mod tests {
         let balances = sample_balances(1_000, 2_000);
 
         let capped = cap_rebalance_to_withdrawable(plan, &balances, 600, 0).unwrap();
-        assert_eq!(capped.withdraw_base_lamports, 880);
+        // withdrawable = 1_000 - (600 / LIQUIDITY_AMPLIFICATION=2) = 700; plan wants 900 → capped to 700
+        assert_eq!(capped.withdraw_base_lamports, 700);
         assert_eq!(capped.withdraw_quote_lamports, 0);
     }
 }

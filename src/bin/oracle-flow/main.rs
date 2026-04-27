@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let flow_reduction_factor = config.flow_reduction_factor;
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
     let rebalance_cooldown = Duration::from_secs(config.rebalance_cooldown_secs);
+    let min_rebalance_value_usd = config.min_rebalance_value_usd;
     let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
     let jupiter_config = config.jupiter.clone();
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Jupiter dry run: {}", jupiter_config.dry_run);
     println!("Devnet mode: {}", is_devnet);
     println!("Rebalance cooldown: {}s", rebalance_cooldown.as_secs());
+    println!("Min rebalance value: ${:.2}", min_rebalance_value_usd);
 
     let mut last_rebalance_at: Option<Instant> = None;
 
@@ -89,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
                     max_flow_reduction_attempts,
                     last_rebalance_at,
                     rebalance_cooldown,
+                    min_rebalance_value_usd,
                     &jupiter_config,
                     is_devnet,
                     market_id,
@@ -120,6 +123,7 @@ async fn run_update_cycle(
     max_flow_reduction_attempts: usize,
     last_rebalance_at: Option<Instant>,
     rebalance_cooldown: Duration,
+    min_rebalance_value_usd: f64,
     jupiter_config: &JupiterConfig,
     is_devnet: bool,
     market_id: u64,
@@ -185,6 +189,7 @@ async fn run_update_cycle(
             jupiter_config,
             flow_reduction_factor,
             max_flow_reduction_attempts,
+            min_rebalance_value_usd,
             is_devnet,
         )
         .await?;

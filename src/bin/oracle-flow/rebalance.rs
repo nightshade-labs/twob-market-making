@@ -109,6 +109,7 @@ pub async fn execute_rebalance(
     jupiter_config: &JupiterConfig,
     _reduction_factor: f64,
     _max_reduction_attempts: usize,
+    min_rebalance_value_usd: f64,
     is_devnet: bool,
 ) -> anyhow::Result<RebalanceOutcome> {
     if is_devnet {
@@ -125,9 +126,9 @@ pub async fn execute_rebalance(
     }
 
     let Some(uncapped_plan) =
-        plan_rebalance(price, balances, base_token_decimals, quote_token_decimals)
+        plan_rebalance(price, balances, base_token_decimals, quote_token_decimals, min_rebalance_value_usd)
     else {
-        println!("[rebalance] skipping — computed withdraw amount rounds to zero");
+        println!("[rebalance] skipping — computed withdraw amount rounds to zero or is below minimum");
         return Ok(RebalanceOutcome::Skipped);
     };
     println!(
@@ -491,6 +492,7 @@ fn plan_rebalance(
     balances: &LiquidityPositionBalances,
     base_token_decimals: u8,
     quote_token_decimals: u8,
+    min_rebalance_value_usd: f64,
 ) -> Option<RebalancePlan> {
     if !price.price.is_finite() || price.price <= 0.0 {
         return None;
@@ -548,8 +550,16 @@ fn plan_rebalance(
 
     let quote_excess_ui = (quote_ui - base_ui * price.price).max(0.0);
     if quote_excess_ui > 0.0 {
-        let withdraw_quote_lamports =
-            ui_amount_to_lamports(quote_excess_ui / 2.0, quote_token_decimals);
+        let withdraw_quote_ui = quote_excess_ui / 2.0;
+        let withdraw_value_usd = withdraw_quote_ui; // quote is USD-denominated
+        if withdraw_value_usd < min_rebalance_value_usd {
+            println!(
+                "[rebalance] plan: quote withdraw ${:.4} is below minimum ${:.2} — no plan",
+                withdraw_value_usd, min_rebalance_value_usd,
+            );
+            return None;
+        }
+        let withdraw_quote_lamports = ui_amount_to_lamports(withdraw_quote_ui, quote_token_decimals);
         if withdraw_quote_lamports > 0 {
             return Some(RebalancePlan {
                 direction: SwapDirection::QuoteToBase,
@@ -559,12 +569,21 @@ fn plan_rebalance(
         }
         println!(
             "[rebalance] plan: quote excess {:.6} rounds to 0 lamports — no plan",
-            quote_excess_ui / 2.0,
+            withdraw_quote_ui,
         );
     }
 
     let base_excess_ui = (base_ui - quote_ui / price.price).max(0.0);
-    let withdraw_base_lamports = ui_amount_to_lamports(base_excess_ui / 2.0, base_token_decimals);
+    let withdraw_base_ui = base_excess_ui / 2.0;
+    let withdraw_value_usd = withdraw_base_ui * price.price;
+    if withdraw_base_ui > 0.0 && withdraw_value_usd < min_rebalance_value_usd {
+        println!(
+            "[rebalance] plan: base withdraw ${:.4} is below minimum ${:.2} — no plan",
+            withdraw_value_usd, min_rebalance_value_usd,
+        );
+        return None;
+    }
+    let withdraw_base_lamports = ui_amount_to_lamports(withdraw_base_ui, base_token_decimals);
     if withdraw_base_lamports > 0 {
         return Some(RebalancePlan {
             direction: SwapDirection::BaseToQuote,
@@ -575,7 +594,7 @@ fn plan_rebalance(
 
     println!(
         "[rebalance] plan: base excess {:.6} rounds to 0 lamports — no plan",
-        base_excess_ui / 2.0,
+        withdraw_base_ui,
     );
     None
 }
@@ -759,7 +778,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let plan = plan_rebalance(&price, &balances, 9, 6).unwrap();
+        let plan = plan_rebalance(&price, &balances, 9, 6, 0.0).unwrap();
         assert_eq!(plan.direction, SwapDirection::QuoteToBase);
         assert_eq!(plan.withdraw_base_lamports, 0);
         assert_eq!(plan.withdraw_quote_lamports, 4_000_000);
@@ -773,7 +792,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let plan = plan_rebalance(&price, &balances, 9, 6).unwrap();
+        let plan = plan_rebalance(&price, &balances, 9, 6, 0.0).unwrap();
         assert_eq!(plan.direction, SwapDirection::BaseToQuote);
         assert_eq!(plan.withdraw_base_lamports, 500_000_000);
         assert_eq!(plan.withdraw_quote_lamports, 0);
@@ -788,7 +807,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let plan = plan_rebalance(&price, &balances, 9, 6).unwrap();
+        let plan = plan_rebalance(&price, &balances, 9, 6, 0.0).unwrap();
         assert_eq!(plan.direction, SwapDirection::QuoteToBase);
         assert_eq!(plan.withdraw_base_lamports, 0);
         assert_eq!(plan.withdraw_quote_lamports, 177_720_086);
@@ -803,7 +822,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let plan = plan_rebalance(&price, &balances, 9, 6).unwrap();
+        let plan = plan_rebalance(&price, &balances, 9, 6, 0.0).unwrap();
         assert_eq!(plan.direction, SwapDirection::BaseToQuote);
         assert_eq!(plan.withdraw_base_lamports, 500_000_000);
         assert_eq!(plan.withdraw_quote_lamports, 0);
@@ -817,7 +836,7 @@ mod tests {
             timestamp: 0,
         };
 
-        assert!(plan_rebalance(&price, &balances, 9, 6).is_none());
+        assert!(plan_rebalance(&price, &balances, 9, 6, 0.0).is_none());
     }
 
     #[test]

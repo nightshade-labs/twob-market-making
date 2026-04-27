@@ -26,6 +26,7 @@ pub struct Config {
     pub flow_reduction_factor: f64,
     pub max_flow_reduction_attempts: usize,
     pub rebalance_cooldown_secs: u64,
+    pub min_rebalance_value_usd: f64,
     pub jupiter: JupiterConfig,
 }
 
@@ -96,6 +97,10 @@ impl Config {
             .unwrap_or_else(|_| "60".to_string())
             .parse::<u64>()?;
 
+        let min_rebalance_value_usd = env::var("MIN_REBALANCE_VALUE_USD")
+            .unwrap_or_else(|_| "1.0".to_string())
+            .parse::<f64>()?;
+
         let jupiter = JupiterConfig {
             api_key: env::var("JUPITER_API_KEY")
                 .ok()
@@ -128,6 +133,7 @@ impl Config {
             flow_reduction_factor,
             max_flow_reduction_attempts,
             rebalance_cooldown_secs,
+            min_rebalance_value_usd,
             jupiter,
         })
     }

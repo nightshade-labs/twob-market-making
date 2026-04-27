@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let optimal_quote_weight = config.optimal_quote_weight;
     let flow_reduction_factor = config.flow_reduction_factor;
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
+    let rebalance_swap_delay = Duration::from_secs(config.rebalance_swap_delay_secs);
     let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
     let jupiter_config = config.jupiter.clone();
@@ -64,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("Jupiter dry run: {}", jupiter_config.dry_run);
     println!("Devnet mode: {}", is_devnet);
+    println!("Rebalance swap delay: {}s", rebalance_swap_delay.as_secs());
 
     loop {
         tokio::select! {
@@ -83,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
                     optimal_quote_weight,
                     flow_reduction_factor,
                     max_flow_reduction_attempts,
+                    rebalance_swap_delay,
                     &jupiter_config,
                     is_devnet,
                     market_id,
@@ -110,6 +113,7 @@ async fn run_update_cycle(
     optimal_quote_weight: f64,
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
+    rebalance_swap_delay: Duration,
     jupiter_config: &JupiterConfig,
     is_devnet: bool,
     market_id: u64,
@@ -162,6 +166,7 @@ async fn run_update_cycle(
             jupiter_config,
             flow_reduction_factor,
             max_flow_reduction_attempts,
+            rebalance_swap_delay,
             is_devnet,
         )
         .await?;

@@ -198,13 +198,29 @@ fn sign_transaction(
     let transaction_bytes = BASE64_STANDARD
         .decode(transaction_base64)
         .context("Failed to decode Jupiter transaction payload")?;
-    let unsigned_transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)
+    let mut transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)
         .context("Failed to deserialize Jupiter transaction")?;
-    let signed_transaction =
-        VersionedTransaction::try_new(unsigned_transaction.message, &[liquidity_provider.as_ref()])
-            .context("Failed to sign Jupiter transaction")?;
 
-    let signed_bytes = bincode::serialize(&signed_transaction)
+    // Jupiter Ultra returns a partially-signed transaction: Jupiter holds co-signer slot(s).
+    // try_new() would replace all signatures, destroying theirs. Instead, find our pubkey's
+    // position in the static account keys and insert our signature at that slot only.
+    let our_pubkey = liquidity_provider.pubkey();
+    let signer_index = transaction
+        .message
+        .static_account_keys()
+        .iter()
+        .position(|key| key == &our_pubkey)
+        .with_context(|| {
+            format!(
+                "Our pubkey {} not found in Jupiter transaction account keys",
+                our_pubkey
+            )
+        })?;
+
+    let message_bytes = transaction.message.serialize();
+    transaction.signatures[signer_index] = liquidity_provider.sign_message(&message_bytes);
+
+    let signed_bytes = bincode::serialize(&transaction)
         .context("Failed to serialize signed Jupiter transaction")?;
     Ok(BASE64_STANDARD.encode(signed_bytes))
 }

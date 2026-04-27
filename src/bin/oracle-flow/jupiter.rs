@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anchor_client::solana_sdk::{
     pubkey::Pubkey,
@@ -70,21 +70,51 @@ impl<'a> JupiterUltraClient<'a> {
             .filter(|value| !value.trim().is_empty())
             .context("JUPITER_API_KEY is required for oracle-flow rebalancing")?;
 
-        let order = self
-            .fetch_order(
-                api_key,
-                &OrderQuery {
-                    input_mint: input_mint.to_string(),
-                    output_mint: output_mint.to_string(),
-                    amount: amount.to_string(),
-                    taker: if self.config.dry_run {
-                        None
-                    } else {
-                        Some(liquidity_provider.pubkey().to_string())
-                    },
-                },
-            )
-            .await?;
+        // Jupiter's RPC may lag behind our confirmed withdrawal by a few seconds.
+        // Retry on error-code 1 (Insufficient funds) up to 5 times with increasing delay.
+        const MAX_ORDER_RETRIES: u32 = 5;
+        let order = 'order: {
+            let mut last_err = anyhow::anyhow!("no attempts made");
+            for attempt in 0..MAX_ORDER_RETRIES {
+                if attempt > 0 {
+                    let delay = Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "[jupiter] order error on attempt {} — waiting {}s before retry",
+                        attempt, delay.as_secs(),
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+
+                let order = self
+                    .fetch_order(
+                        api_key,
+                        &OrderQuery {
+                            input_mint: input_mint.to_string(),
+                            output_mint: output_mint.to_string(),
+                            amount: amount.to_string(),
+                            taker: if self.config.dry_run {
+                                None
+                            } else {
+                                Some(liquidity_provider.pubkey().to_string())
+                            },
+                        },
+                    )
+                    .await;
+
+                match order {
+                    Ok(o) if o.error_code == Some(1) => {
+                        last_err = anyhow::anyhow!(
+                            "Jupiter order returned error 1: {} (attempt {})",
+                            o.error_message.as_deref().unwrap_or("Insufficient funds"),
+                            attempt + 1,
+                        );
+                    }
+                    Ok(o) => break 'order o,
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(last_err);
+        };
 
         order.validate(input_mint, output_mint, amount, self.config)?;
 

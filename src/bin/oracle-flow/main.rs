@@ -296,17 +296,28 @@ async fn execute_update_flows_with_backoff(
 
         let err = &simulation.value.err;
         let logs = simulation.value.logs.as_deref();
+
+        if is_blockhash_not_found(err) {
+            // Transient: the blockhash hasn't propagated to all validators yet.
+            // The next iteration calls signed_transaction() again, fetching a fresh one.
+            println!(
+                "[update] simulation returned BlockhashNotFound on attempt {} — retrying with fresh blockhash",
+                attempt + 1,
+            );
+            continue;
+        }
+
         if is_liquidity_position_unhealthy(err, logs) {
             let next_base_flow = reduce_flow(candidate_base_flow, flow_reduction_factor);
             let next_quote_flow = reduce_flow(candidate_quote_flow, flow_reduction_factor);
 
             println!(
-                "Simulation failed with LiquidityPositionUnhealthy on attempt {}. Reducing flows: base {} -> {}, quote {} -> {}",
+                "[update] LiquidityPositionUnhealthy on attempt {}. Reducing flows: base {} -> {}, quote {} -> {}",
                 attempt + 1,
                 candidate_base_flow,
                 next_base_flow,
                 candidate_quote_flow,
-                next_quote_flow
+                next_quote_flow,
             );
 
             if next_base_flow == candidate_base_flow && next_quote_flow == candidate_quote_flow {
@@ -334,6 +345,15 @@ async fn execute_update_flows_with_backoff(
         max_flow_reduction_attempts,
         candidate_base_flow,
         candidate_quote_flow
+    )
+}
+
+fn is_blockhash_not_found(
+    err: &Option<anchor_client::solana_sdk::transaction::TransactionError>,
+) -> bool {
+    matches!(
+        err,
+        Some(anchor_client::solana_sdk::transaction::TransactionError::BlockhashNotFound)
     )
 }
 

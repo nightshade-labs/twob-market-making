@@ -4,7 +4,10 @@ mod price;
 mod quote;
 mod rebalance;
 
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anchor_client::{
     Client,
@@ -16,11 +19,14 @@ use quote::{calculate_optimal_quote, should_update_quote};
 use rebalance::{RebalanceOutcome, execute_rebalance, needs_rebalance};
 use tokio::{signal, time::sleep};
 use twob_market_making::{
-    ARRAY_LENGTH, build_update_liquidity_flows_instruction, execute_update_flows,
-    fetch_liquidity_position, fetch_market_state, get_liquidity_position_balances, twob_anchor,
+    ARRAY_LENGTH, LiquidityPositionBalances, MarketState, build_update_liquidity_flows_instruction,
+    execute_update_flows, fetch_liquidity_position, fetch_market_state,
+    get_liquidity_position_balances,
+    twob_anchor::{self, accounts::LiquidityPosition},
 };
 
 const LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE: u32 = 6013;
+type OracleProgram = anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -111,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_update_cycle(
-    program: &anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>,
+    program: &OracleProgram,
     http_client: &reqwest::Client,
     price_feed_url: &str,
     quote_threshold_bps: u64,
@@ -138,19 +144,19 @@ async fn run_update_cycle(
     println!("[price] oracle={:.6}", price_data.price);
 
     // 2. Fetch liquidity position and market state
-    let mut market_state = fetch_market_state(program, market_id).await?;
-    let mut position = fetch_liquidity_position(program, market_id, authority).await?;
-    let mut balances = get_liquidity_position_balances(
-        program,
-        position,
-        market_state.bookkeeping,
-        market_state.market,
-        market_state.current_slot,
-    )
-    .await;
+    let (mut market_state, mut position, mut balances) =
+        refresh_position_state(program, market_id, authority).await?;
 
-    println!("[market] base_flow={} quote_flow={} end_slot_interval={}", market_state.market.base_flow, market_state.market.quote_flow, market_state.market.end_slot_interval);
-    println!("[position] base_flow={} quote_flow={}", position.base_flow_u64, position.quote_flow_u64);
+    println!(
+        "[market] base_flow={} quote_flow={} end_slot_interval={}",
+        market_state.market.base_flow,
+        market_state.market.quote_flow,
+        market_state.market.end_slot_interval
+    );
+    println!(
+        "[position] base_flow={} quote_flow={}",
+        position.base_flow_u64, position.quote_flow_u64
+    );
 
     // 3. Check if rebalance is needed
     let mut new_rebalance_at: Option<Instant> = None;
@@ -174,7 +180,8 @@ async fn run_update_cycle(
         rebalance_threshold_bps,
     ) {
         println!("[rebalance] triggered");
-        let rebalance_outcome = execute_rebalance(
+        let attempt_started_at = Instant::now();
+        let rebalance_result = execute_rebalance(
             program,
             http_client,
             market_id,
@@ -192,30 +199,54 @@ async fn run_update_cycle(
             min_rebalance_value_usd,
             is_devnet,
         )
-        .await?;
+        .await;
 
-        match rebalance_outcome {
-            RebalanceOutcome::Executed => {
-                let now = Instant::now();
-                new_rebalance_at = Some(now);
-                // Re-fetch position data after rebalance
-                market_state = fetch_market_state(program, market_id).await?;
-                position = fetch_liquidity_position(program, market_id, authority).await?;
-                balances = get_liquidity_position_balances(
-                    program,
-                    position,
-                    market_state.bookkeeping,
-                    market_state.market,
-                    market_state.current_slot,
-                )
-                .await;
+        match rebalance_result {
+            Ok(RebalanceOutcome::Executed) => {
+                new_rebalance_at = Some(attempt_started_at);
+                match refresh_position_state(program, market_id, authority).await {
+                    Ok((new_market_state, new_position, new_balances)) => {
+                        market_state = new_market_state;
+                        position = new_position;
+                        balances = new_balances;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[rebalance] completed but refresh failed: {:#}. skipping quote update this cycle",
+                            error,
+                        );
+                        return Ok(new_rebalance_at);
+                    }
+                }
                 println!(
                     "[rebalance] completed — cooldown of {}s starts now",
                     rebalance_cooldown.as_secs(),
                 );
             }
-            RebalanceOutcome::Skipped => {
+            Ok(RebalanceOutcome::Skipped) => {
                 println!("[rebalance] skipped (see reason above)");
+            }
+            Err(error) => {
+                new_rebalance_at = Some(attempt_started_at);
+                eprintln!(
+                    "[rebalance] failed: {:#}. cooldown of {}s starts now",
+                    error,
+                    rebalance_cooldown.as_secs(),
+                );
+                match refresh_position_state(program, market_id, authority).await {
+                    Ok((new_market_state, new_position, new_balances)) => {
+                        market_state = new_market_state;
+                        position = new_position;
+                        balances = new_balances;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[rebalance] refresh after failure failed: {:#}. skipping quote update this cycle",
+                            error,
+                        );
+                        return Ok(new_rebalance_at);
+                    }
+                }
             }
         }
     } else {
@@ -247,8 +278,10 @@ async fn run_update_cycle(
         println!(
             "[update] deviation exceeds {} bps — updating flows: base {} -> {} quote {} -> {}",
             quote_threshold_bps,
-            current_base_flow, optimal.base_flow,
-            current_quote_flow, optimal.quote_flow,
+            current_base_flow,
+            optimal.base_flow,
+            current_quote_flow,
+            optimal.quote_flow,
         );
 
         let reference_index = (market_state.current_slot + ARRAY_LENGTH / 2)
@@ -281,9 +314,28 @@ async fn run_update_cycle(
     Ok(new_rebalance_at)
 }
 
+async fn refresh_position_state(
+    program: &OracleProgram,
+    market_id: u64,
+    authority: &anchor_client::solana_sdk::pubkey::Pubkey,
+) -> anyhow::Result<(MarketState, LiquidityPosition, LiquidityPositionBalances)> {
+    let market_state = fetch_market_state(program, market_id).await?;
+    let position = fetch_liquidity_position(program, market_id, authority).await?;
+    let balances = get_liquidity_position_balances(
+        program,
+        position,
+        market_state.bookkeeping,
+        market_state.market,
+        market_state.current_slot,
+    )
+    .await;
+
+    Ok((market_state, position, balances))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_update_flows_with_backoff(
-    program: &anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>,
+    program: &OracleProgram,
     market_id: u64,
     base_flow: u64,
     quote_flow: u64,

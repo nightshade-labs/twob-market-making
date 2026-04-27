@@ -1,15 +1,18 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anchor_client::{
     Program,
-    solana_sdk::{signature::Keypair, signer::Signer},
+    solana_sdk::{
+        commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
+    },
 };
-use anchor_lang::solana_program::program_pack::Pack;
+use anchor_lang::solana_program::{program_pack::Pack, system_instruction};
 use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
     token::spl_token::state::Account as SplTokenAccount,
 };
 use anyhow::{Context, ensure};
+use tokio::time::sleep;
 use twob_market_making::{
     ARRAY_LENGTH, AccountResolver, LIQUIDITY_AMPLIFICATION, LiquidityPositionBalances, MarketState,
     build_withdraw_liquidity_instruction, execute_add_liquidity, execute_withdraw_liquidity,
@@ -40,6 +43,21 @@ impl RebalancePlan {
         match self.direction {
             SwapDirection::BaseToQuote => self.withdraw_base_lamports,
             SwapDirection::QuoteToBase => self.withdraw_quote_lamports,
+        }
+    }
+
+    fn with_input_amount(self, amount: u64) -> Self {
+        match self.direction {
+            SwapDirection::BaseToQuote => Self {
+                withdraw_base_lamports: amount,
+                withdraw_quote_lamports: 0,
+                ..self
+            },
+            SwapDirection::QuoteToBase => Self {
+                withdraw_base_lamports: 0,
+                withdraw_quote_lamports: amount,
+                ..self
+            },
         }
     }
 }
@@ -84,15 +102,16 @@ pub fn needs_rebalance(
         price.price,
         deviation_bps,
         threshold_bps,
-        if deviation_bps > threshold_bps as f64 { "needed" } else { "ok" },
+        if deviation_bps > threshold_bps as f64 {
+            "needed"
+        } else {
+            "ok"
+        },
     );
 
     deviation_bps > threshold_bps as f64
 }
 
-/// Execute the rebalancing operation.
-///
-/// TODO: Replace with actual rebalancing logic.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_rebalance(
     program: &Program<Arc<Keypair>>,
@@ -125,10 +144,16 @@ pub async fn execute_rebalance(
         return Ok(RebalanceOutcome::Skipped);
     }
 
-    let Some(uncapped_plan) =
-        plan_rebalance(price, balances, base_token_decimals, quote_token_decimals, min_rebalance_value_usd)
-    else {
-        println!("[rebalance] skipping — computed withdraw amount rounds to zero or is below minimum");
+    let Some(uncapped_plan) = plan_rebalance(
+        price,
+        balances,
+        base_token_decimals,
+        quote_token_decimals,
+        min_rebalance_value_usd,
+    ) else {
+        println!(
+            "[rebalance] skipping — computed withdraw amount rounds to zero or is below minimum"
+        );
         return Ok(RebalanceOutcome::Skipped);
     };
     println!(
@@ -146,10 +171,7 @@ pub async fn execute_rebalance(
         println!(
             "[rebalance] skipping — no withdrawable liquidity after capping to available balance \
              (base_balance={} quote_balance={} base_flow={} quote_flow={})",
-            balances.base_balance,
-            balances.quote_balance,
-            current_base_flow,
-            current_quote_flow,
+            balances.base_balance, balances.quote_balance, current_base_flow, current_quote_flow,
         );
         return Ok(RebalanceOutcome::Skipped);
     };
@@ -159,35 +181,7 @@ pub async fn execute_rebalance(
         plan.withdraw_base_lamports,
         plan.withdraw_quote_lamports,
     );
-    let withdraw_reference_index =
-        oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
-
-    println!(
-        "Executing rebalance {}: withdraw_base={} withdraw_quote={}",
-        plan.direction.label(),
-        plan.withdraw_base_lamports,
-        plan.withdraw_quote_lamports
-    );
-    log_rebalance_transfer_accounts(
-        program,
-        market_id,
-        market_state,
-        liquidity_provider.pubkey(),
-        plan,
-    )
-    .await;
-
-    let executed_plan = execute_exact_withdraw_liquidity(
-        program,
-        market_id,
-        withdraw_reference_index,
-        liquidity_provider.clone(),
-        plan,
-    )
-    .await
-    .context("Failed to withdraw liquidity for rebalance")?;
-
-    let (input_mint, output_mint) = match executed_plan.direction {
+    let (input_mint, output_mint) = match plan.direction {
         SwapDirection::BaseToQuote => (
             market_state.market.base_mint,
             market_state.market.quote_mint,
@@ -198,34 +192,85 @@ pub async fn execute_rebalance(
         ),
     };
 
-    // Read the LP's actual ATA balance after withdrawal. The withdraw tx is submitted but
-    // may not be confirmed by the time Jupiter queries it, so the confirmed on-chain
-    // balance is the ground truth for what Jupiter can actually spend.
     let input_token_program = get_token_program_id(program, &input_mint).await?;
     let lp_input_ata = get_associated_token_address_with_program_id(
         &liquidity_provider.pubkey(),
         &input_mint,
         &input_token_program,
     );
-    let actual_ata_balance = read_ata_balance(program, &lp_input_ata).await?;
-    let intended_amount = executed_plan.input_amount();
-    let swap_amount = actual_ata_balance.min(intended_amount);
+    let target_swap_amount = plan.input_amount();
+    let existing_input_balance = read_swap_input_balance(
+        program,
+        &input_mint,
+        &lp_input_ata,
+        &liquidity_provider.pubkey(),
+    )
+    .await?;
+    let withdraw_amount = target_swap_amount.saturating_sub(existing_input_balance);
+    let withdraw_plan = plan.with_input_amount(withdraw_amount);
 
     println!(
-        "[jupiter] ATA {} balance after withdrawal: intended={} actual={} using={}",
-        lp_input_ata, intended_amount, actual_ata_balance, swap_amount,
+        "Executing rebalance {}: target_swap={} wallet_input={} withdraw_base={} withdraw_quote={}",
+        plan.direction.label(),
+        target_swap_amount,
+        existing_input_balance,
+        withdraw_plan.withdraw_base_lamports,
+        withdraw_plan.withdraw_quote_lamports
+    );
+    log_rebalance_transfer_accounts(
+        program,
+        market_id,
+        market_state,
+        liquidity_provider.pubkey(),
+        withdraw_plan,
+    )
+    .await;
+
+    if withdraw_amount > 0 {
+        let withdraw_reference_index =
+            oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
+        execute_exact_withdraw_liquidity(
+            program,
+            market_id,
+            withdraw_reference_index,
+            liquidity_provider.clone(),
+            withdraw_plan,
+        )
+        .await
+        .context("Failed to withdraw liquidity for rebalance")?;
+    } else {
+        println!("[rebalance] using wallet input balance; no additional withdraw needed");
+    }
+
+    let expected_input_balance = existing_input_balance.saturating_add(withdraw_amount);
+    let actual_input_balance = wait_for_swap_input_balance(
+        program,
+        &input_mint,
+        &lp_input_ata,
+        &liquidity_provider.pubkey(),
+        expected_input_balance.min(target_swap_amount),
+    )
+    .await?;
+    let swap_amount = actual_input_balance.min(target_swap_amount);
+
+    println!(
+        "[jupiter] input balance after withdrawal: target={} actual={} using={}",
+        target_swap_amount, actual_input_balance, swap_amount,
     );
 
     if swap_amount == 0 {
-        println!("[rebalance] ATA balance is 0 after withdrawal — skipping swap");
+        if withdraw_amount > 0 {
+            anyhow::bail!("withdraw succeeded but no Jupiter input balance is visible");
+        }
+        println!("[rebalance] no Jupiter input balance available — skipping swap");
         return Ok(RebalanceOutcome::Skipped);
     }
 
     // Jupiter Ultra validates the LP's *native SOL wallet balance* for wSOL swaps,
-    // not the SPL token ATA balance. If the wallet has insufficient native SOL, close
-    // the wSOL ATA to convert it — the lamports flow to the owner's native wallet.
-    // TwoB's add_liquidity uses init_if_needed, so the ATA is recreated when needed.
-    let wsol_ata_closed = maybe_close_wsol_ata_for_jupiter(
+    // not the SPL token ATA balance. Always unwrap wSOL input before ordering, otherwise
+    // Jupiter can spend fee-wallet SOL while the withdrawn wSOL stays stranded outside
+    // the liquidity position.
+    prepare_wsol_input_for_jupiter(
         program,
         &input_mint,
         &lp_input_ata,
@@ -245,11 +290,11 @@ pub async fn execute_rebalance(
         .with_context(|| {
             format!(
                 "Failed to execute Jupiter Ultra swap {}",
-                executed_plan.direction.label()
+                plan.direction.label()
             )
         })?;
 
-    let (mut deposit_base_lamports, deposit_quote_lamports) = match executed_plan.direction {
+    let (mut deposit_base_lamports, mut deposit_quote_lamports) = match plan.direction {
         SwapDirection::BaseToQuote => (
             swap_amount.saturating_sub(swap_execution.input_consumed),
             swap_execution.output_received,
@@ -260,21 +305,31 @@ pub async fn execute_rebalance(
         ),
     };
 
-    // If we closed the wSOL ATA and Jupiter didn't consume the full amount (rare),
-    // the unconsumed SOL sits in the native wallet. Skip the base deposit — it will
-    // be picked up by the next rebalance cycle once the cooldown expires.
-    if wsol_ata_closed && deposit_base_lamports > 0 {
-        eprintln!(
-            "[rebalance] wSOL ATA was closed but Jupiter left {} base lamports unconsumed — \
-             skipping base deposit (stays in native wallet)",
-            deposit_base_lamports,
-        );
-        deposit_base_lamports = 0;
-    }
-
     ensure!(
         deposit_base_lamports > 0 || deposit_quote_lamports > 0,
         "Jupiter swap produced no liquidity to add back after rebalance"
+    );
+
+    deposit_base_lamports = prepare_deposit_balance(
+        program,
+        &market_state.market.base_mint,
+        &liquidity_provider.pubkey(),
+        deposit_base_lamports,
+        liquidity_provider.clone(),
+    )
+    .await?;
+    deposit_quote_lamports = prepare_deposit_balance(
+        program,
+        &market_state.market.quote_mint,
+        &liquidity_provider.pubkey(),
+        deposit_quote_lamports,
+        liquidity_provider.clone(),
+    )
+    .await?;
+
+    ensure!(
+        deposit_base_lamports > 0 || deposit_quote_lamports > 0,
+        "No settled Jupiter output is available to add back after rebalance"
     );
 
     let add_reference_index =
@@ -559,7 +614,8 @@ fn plan_rebalance(
             );
             return None;
         }
-        let withdraw_quote_lamports = ui_amount_to_lamports(withdraw_quote_ui, quote_token_decimals);
+        let withdraw_quote_lamports =
+            ui_amount_to_lamports(withdraw_quote_ui, quote_token_decimals);
         if withdraw_quote_lamports > 0 {
             return Some(RebalancePlan {
                 direction: SwapDirection::QuoteToBase,
@@ -631,79 +687,271 @@ fn cap_rebalance_to_withdrawable(
 const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 /// Lamports kept in the native wallet to cover transaction fees when we close the ATA.
 const FEE_RESERVE_LAMPORTS: u64 = 10_000_000; // 0.01 SOL
+const BALANCE_POLL_ATTEMPTS: usize = 8;
+const BALANCE_POLL_DELAY: Duration = Duration::from_millis(750);
 
-/// If `input_mint` is native SOL and the LP's wallet has insufficient native balance for
-/// the swap, close the wSOL ATA so the lamports flow to the native wallet.
-/// Returns `true` if the ATA was closed.
-async fn maybe_close_wsol_ata_for_jupiter(
+async fn prepare_wsol_input_for_jupiter(
     program: &Program<Arc<Keypair>>,
-    input_mint: &anchor_client::solana_sdk::pubkey::Pubkey,
-    wsol_ata: &anchor_client::solana_sdk::pubkey::Pubkey,
+    input_mint: &Pubkey,
+    wsol_ata: &Pubkey,
     swap_amount: u64,
     signer: Arc<Keypair>,
-) -> anyhow::Result<bool> {
-    let native_mint: anchor_client::solana_sdk::pubkey::Pubkey =
-        NATIVE_SOL_MINT.parse().expect("hardcoded native mint");
-    if *input_mint != native_mint {
-        return Ok(false);
+) -> anyhow::Result<()> {
+    if !is_native_sol_mint(input_mint) {
+        return Ok(());
     }
 
     let lp_pubkey = signer.pubkey();
-    let native_balance = program
-        .rpc()
-        .get_balance(&lp_pubkey)
+    let wsol_balance = read_ata_balance_or_zero(program, wsol_ata).await?;
+
+    if wsol_balance > 0 {
+        println!(
+            "[jupiter] unwrapping {} wSOL lamports from {} before swap",
+            wsol_balance, wsol_ata,
+        );
+        let close_ix = anchor_spl::token::spl_token::instruction::close_account(
+            &anchor_spl::token::spl_token::ID,
+            wsol_ata,
+            &lp_pubkey,
+            &lp_pubkey,
+            &[],
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to build close_account instruction: {e}"))?;
+
+        program
+            .request()
+            .instruction(close_ix)
+            .signer(signer.clone())
+            .send()
+            .await
+            .context("Failed to close wSOL ATA")?;
+    }
+
+    let required_native = swap_amount
+        .checked_add(FEE_RESERVE_LAMPORTS)
+        .context("SOL swap amount plus fee reserve overflowed")?;
+    let native_balance = wait_for_native_balance_at_least(program, &lp_pubkey, required_native)
         .await
-        .context("Failed to read LP native SOL balance")?;
+        .context("Failed to confirm native SOL balance before Jupiter swap")?;
 
     println!(
         "[jupiter] native SOL wallet: {} lamports (swap needs {} + {} fee reserve)",
         native_balance, swap_amount, FEE_RESERVE_LAMPORTS,
     );
 
-    if native_balance >= swap_amount + FEE_RESERVE_LAMPORTS {
-        return Ok(false);
-    }
-
-    println!(
-        "[jupiter] insufficient native SOL — closing wSOL ATA to convert lamports to native"
+    ensure!(
+        native_balance >= required_native,
+        "Insufficient native SOL for Jupiter swap: balance={} required={}",
+        native_balance,
+        required_native
     );
-    let close_ix = anchor_spl::token::spl_token::instruction::close_account(
-        &anchor_spl::token::spl_token::ID,
-        wsol_ata,
-        &lp_pubkey,
-        &lp_pubkey,
-        &[],
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to build close_account instruction: {e}"))?;
 
-    program
-        .request()
-        .instruction(close_ix)
-        .signer(signer.clone())
-        .send()
-        .await
-        .context("Failed to close wSOL ATA")?;
-
-    let new_native = program.rpc().get_balance(&lp_pubkey).await.unwrap_or(0);
-    println!(
-        "[jupiter] wSOL ATA closed — native SOL wallet now has {} lamports",
-        new_native,
-    );
-    Ok(true)
+    Ok(())
 }
 
-async fn read_ata_balance(
+async fn read_ata_balance_or_zero(
     program: &Program<Arc<Keypair>>,
-    token_account: &anchor_client::solana_sdk::pubkey::Pubkey,
+    token_account: &Pubkey,
 ) -> anyhow::Result<u64> {
-    let account = program
-        .rpc()
-        .get_account(token_account)
-        .await
-        .with_context(|| format!("Failed to fetch ATA {}", token_account))?;
+    let Some(account) = read_token_account(program, token_account).await? else {
+        return Ok(0);
+    };
     let state = SplTokenAccount::unpack(&account.data)
         .with_context(|| format!("Failed to decode ATA {}", token_account))?;
     Ok(state.amount)
+}
+
+async fn read_token_account(
+    program: &Program<Arc<Keypair>>,
+    token_account: &Pubkey,
+) -> anyhow::Result<Option<anchor_client::solana_sdk::account::Account>> {
+    let response = program
+        .rpc()
+        .get_account_with_commitment(token_account, CommitmentConfig::confirmed())
+        .await
+        .with_context(|| format!("Failed to fetch token account {}", token_account))?;
+    Ok(response.value)
+}
+
+async fn read_swap_input_balance(
+    program: &Program<Arc<Keypair>>,
+    input_mint: &Pubkey,
+    input_ata: &Pubkey,
+    owner: &Pubkey,
+) -> anyhow::Result<u64> {
+    if is_native_sol_mint(input_mint) {
+        let native_balance = program
+            .rpc()
+            .get_balance(owner)
+            .await
+            .context("Failed to read LP native SOL balance")?
+            .saturating_sub(FEE_RESERVE_LAMPORTS);
+        let wsol_balance = read_ata_balance_or_zero(program, input_ata).await?;
+        return Ok(native_balance.saturating_add(wsol_balance));
+    }
+
+    read_ata_balance_or_zero(program, input_ata).await
+}
+
+async fn wait_for_swap_input_balance(
+    program: &Program<Arc<Keypair>>,
+    input_mint: &Pubkey,
+    input_ata: &Pubkey,
+    owner: &Pubkey,
+    expected_amount: u64,
+) -> anyhow::Result<u64> {
+    let mut last_balance = 0;
+    for attempt in 0..BALANCE_POLL_ATTEMPTS {
+        last_balance = read_swap_input_balance(program, input_mint, input_ata, owner).await?;
+        if last_balance >= expected_amount {
+            return Ok(last_balance);
+        }
+        if attempt + 1 < BALANCE_POLL_ATTEMPTS {
+            sleep(BALANCE_POLL_DELAY).await;
+        }
+    }
+    Ok(last_balance)
+}
+
+async fn wait_for_ata_balance_at_least(
+    program: &Program<Arc<Keypair>>,
+    token_account: &Pubkey,
+    expected_amount: u64,
+) -> anyhow::Result<u64> {
+    let mut last_balance = 0;
+    for attempt in 0..BALANCE_POLL_ATTEMPTS {
+        last_balance = read_ata_balance_or_zero(program, token_account).await?;
+        if last_balance >= expected_amount {
+            return Ok(last_balance);
+        }
+        if attempt + 1 < BALANCE_POLL_ATTEMPTS {
+            sleep(BALANCE_POLL_DELAY).await;
+        }
+    }
+    Ok(last_balance)
+}
+
+async fn wait_for_native_balance_at_least(
+    program: &Program<Arc<Keypair>>,
+    owner: &Pubkey,
+    expected_amount: u64,
+) -> anyhow::Result<u64> {
+    let mut last_balance = 0;
+    for attempt in 0..BALANCE_POLL_ATTEMPTS {
+        last_balance = program
+            .rpc()
+            .get_balance(owner)
+            .await
+            .context("Failed to read native SOL balance")?;
+        if last_balance >= expected_amount {
+            return Ok(last_balance);
+        }
+        if attempt + 1 < BALANCE_POLL_ATTEMPTS {
+            sleep(BALANCE_POLL_DELAY).await;
+        }
+    }
+    Ok(last_balance)
+}
+
+async fn prepare_deposit_balance(
+    program: &Program<Arc<Keypair>>,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    requested_amount: u64,
+    signer: Arc<Keypair>,
+) -> anyhow::Result<u64> {
+    if requested_amount == 0 {
+        return Ok(0);
+    }
+
+    let token_program = get_token_program_id(program, mint).await?;
+    let ata = get_associated_token_address_with_program_id(owner, mint, &token_program);
+
+    if is_native_sol_mint(mint) {
+        return prepare_wsol_deposit_balance(program, &ata, requested_amount, signer).await;
+    }
+
+    let available = wait_for_ata_balance_at_least(program, &ata, requested_amount).await?;
+    if available < requested_amount {
+        eprintln!(
+            "[rebalance] capping deposit for mint {}: requested={} available={}",
+            mint, requested_amount, available,
+        );
+    }
+    Ok(available.min(requested_amount))
+}
+
+async fn prepare_wsol_deposit_balance(
+    program: &Program<Arc<Keypair>>,
+    wsol_ata: &Pubkey,
+    requested_amount: u64,
+    signer: Arc<Keypair>,
+) -> anyhow::Result<u64> {
+    let current_wsol = read_ata_balance_or_zero(program, wsol_ata).await?;
+    if current_wsol >= requested_amount {
+        return Ok(requested_amount);
+    }
+
+    let owner = signer.pubkey();
+    let deficit = requested_amount - current_wsol;
+    let required_native = deficit
+        .checked_add(FEE_RESERVE_LAMPORTS)
+        .context("wSOL wrap amount plus fee reserve overflowed")?;
+    let native_balance = wait_for_native_balance_at_least(program, &owner, required_native).await?;
+    let wrap_amount = native_balance
+        .saturating_sub(FEE_RESERVE_LAMPORTS)
+        .min(deficit);
+
+    if wrap_amount == 0 {
+        eprintln!(
+            "[rebalance] capping wSOL deposit: requested={} available={}",
+            requested_amount, current_wsol,
+        );
+        return Ok(current_wsol.min(requested_amount));
+    }
+
+    let native_mint = native_sol_mint();
+    let create_ata_ix =
+        anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &owner,
+            &owner,
+            &native_mint,
+            &anchor_spl::token::spl_token::ID,
+        );
+    let transfer_ix = system_instruction::transfer(&owner, wsol_ata, wrap_amount);
+    let sync_ix = anchor_spl::token::spl_token::instruction::sync_native(
+        &anchor_spl::token::spl_token::ID,
+        wsol_ata,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to build sync_native instruction: {e}"))?;
+
+    program
+        .request()
+        .instruction(create_ata_ix)
+        .instruction(transfer_ix)
+        .instruction(sync_ix)
+        .signer(signer)
+        .send()
+        .await
+        .context("Failed to wrap native SOL for add_liquidity")?;
+
+    let expected_wsol = current_wsol.saturating_add(wrap_amount);
+    let final_wsol = wait_for_ata_balance_at_least(program, wsol_ata, expected_wsol).await?;
+    if final_wsol < requested_amount {
+        eprintln!(
+            "[rebalance] capping wSOL deposit after wrap: requested={} available={}",
+            requested_amount, final_wsol,
+        );
+    }
+    Ok(final_wsol.min(requested_amount))
+}
+
+fn native_sol_mint() -> Pubkey {
+    NATIVE_SOL_MINT.parse().expect("hardcoded native mint")
+}
+
+fn is_native_sol_mint(mint: &Pubkey) -> bool {
+    *mint == native_sol_mint()
 }
 
 fn ui_amount_to_lamports(amount_ui: f64, decimals: u8) -> u64 {

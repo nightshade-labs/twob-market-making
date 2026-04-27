@@ -61,6 +61,10 @@ pub fn needs_rebalance(
     }
 
     if balances.base_balance == 0 || balances.quote_balance == 0 {
+        println!(
+            "[rebalance] one side is zero (base={} quote={}) — rebalance needed",
+            balances.base_balance, balances.quote_balance,
+        );
         return true;
     }
 
@@ -75,8 +79,12 @@ pub fn needs_rebalance(
     let deviation_bps = ((inventory_price - price.price).abs() / price.price) * 10_000.0;
 
     println!(
-        "Rebalance check: inventory_price={} oracle_price={} deviation_bps={:.2} threshold_bps={}",
-        inventory_price, price.price, deviation_bps, threshold_bps
+        "[rebalance] inventory_price={:.6} oracle_price={:.6} deviation={:.2} bps threshold={} bps — {}",
+        inventory_price,
+        price.price,
+        deviation_bps,
+        threshold_bps,
+        if deviation_bps > threshold_bps as f64 { "needed" } else { "ok" },
     );
 
     deviation_bps > threshold_bps as f64
@@ -116,19 +124,40 @@ pub async fn execute_rebalance(
         return Ok(RebalanceOutcome::Skipped);
     }
 
-    let Some(plan) = plan_rebalance(price, balances, base_token_decimals, quote_token_decimals)
+    let Some(uncapped_plan) =
+        plan_rebalance(price, balances, base_token_decimals, quote_token_decimals)
     else {
-        println!("Rebalance requested but computed withdraw amount is zero; skipping");
+        println!("[rebalance] skipping — computed withdraw amount rounds to zero");
         return Ok(RebalanceOutcome::Skipped);
     };
-    let Some(plan) =
-        cap_rebalance_to_withdrawable(plan, balances, current_base_flow, current_quote_flow)
-    else {
+    println!(
+        "[rebalance] planned {} withdraw: base={} quote={}",
+        uncapped_plan.direction.label(),
+        uncapped_plan.withdraw_base_lamports,
+        uncapped_plan.withdraw_quote_lamports,
+    );
+    let Some(plan) = cap_rebalance_to_withdrawable(
+        uncapped_plan,
+        balances,
+        current_base_flow,
+        current_quote_flow,
+    ) else {
         println!(
-            "Rebalance requested but no withdrawable liquidity is available on the excess side; skipping"
+            "[rebalance] skipping — no withdrawable liquidity after capping to available balance \
+             (base_balance={} quote_balance={} base_flow={} quote_flow={})",
+            balances.base_balance,
+            balances.quote_balance,
+            current_base_flow,
+            current_quote_flow,
         );
         return Ok(RebalanceOutcome::Skipped);
     };
+    println!(
+        "[rebalance] capped {} withdraw: base={} quote={}",
+        plan.direction.label(),
+        plan.withdraw_base_lamports,
+        plan.withdraw_quote_lamports,
+    );
     let withdraw_reference_index =
         oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
 
@@ -426,8 +455,23 @@ fn plan_rebalance(
     let base_ui = balances.base_balance as f64 / 10f64.powi(i32::from(base_token_decimals));
     let quote_ui = balances.quote_balance as f64 / 10f64.powi(i32::from(quote_token_decimals));
     if !base_ui.is_finite() || !quote_ui.is_finite() || base_ui <= 0.0 || quote_ui <= 0.0 {
+        println!(
+            "[rebalance] plan: cannot plan — invalid UI amounts (base={} quote={})",
+            base_ui, quote_ui,
+        );
         return None;
     }
+
+    println!(
+        "[rebalance] plan: base={:.6} quote={:.6} oracle={:.6} \
+         ideal_quote={:.6} quote_excess={:.6} base_excess={:.6}",
+        base_ui,
+        quote_ui,
+        price.price,
+        base_ui * price.price,
+        (quote_ui - base_ui * price.price).max(0.0),
+        (base_ui - quote_ui / price.price).max(0.0),
+    );
 
     let quote_excess_ui = (quote_ui - base_ui * price.price).max(0.0);
     if quote_excess_ui > 0.0 {
@@ -440,6 +484,10 @@ fn plan_rebalance(
                 withdraw_quote_lamports,
             });
         }
+        println!(
+            "[rebalance] plan: quote excess {:.6} rounds to 0 lamports — no plan",
+            quote_excess_ui / 2.0,
+        );
     }
 
     let base_excess_ui = (base_ui - quote_ui / price.price).max(0.0);
@@ -452,6 +500,10 @@ fn plan_rebalance(
         });
     }
 
+    println!(
+        "[rebalance] plan: base excess {:.6} rounds to 0 lamports — no plan",
+        base_excess_ui / 2.0,
+    );
     None
 }
 

@@ -146,7 +146,7 @@ async fn run_update_cycle(
         quote_token_decimals,
         rebalance_threshold_bps,
     ) {
-        println!("Inventory rebalance needed");
+        println!("[rebalance] triggered");
         let rebalance_outcome = execute_rebalance(
             program,
             http_client,
@@ -166,20 +166,27 @@ async fn run_update_cycle(
         )
         .await?;
 
-        if rebalance_outcome == RebalanceOutcome::Executed {
-            // Re-fetch position data after rebalance
-            market_state = fetch_market_state(program, market_id).await?;
-            position = fetch_liquidity_position(program, market_id, authority).await?;
-            balances = get_liquidity_position_balances(
-                program,
-                position,
-                market_state.bookkeeping,
-                market_state.market,
-                market_state.current_slot,
-            )
-            .await;
-            println!("Rebalance completed, position data refreshed");
+        match rebalance_outcome {
+            RebalanceOutcome::Executed => {
+                // Re-fetch position data after rebalance
+                market_state = fetch_market_state(program, market_id).await?;
+                position = fetch_liquidity_position(program, market_id, authority).await?;
+                balances = get_liquidity_position_balances(
+                    program,
+                    position,
+                    market_state.bookkeeping,
+                    market_state.market,
+                    market_state.current_slot,
+                )
+                .await;
+                println!("[rebalance] completed — position data refreshed");
+            }
+            RebalanceOutcome::Skipped => {
+                println!("[rebalance] skipped (see reason above)");
+            }
         }
+    } else {
+        println!("[rebalance] not needed");
     }
 
     // 4. Calculate optimal quote

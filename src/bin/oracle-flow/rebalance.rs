@@ -220,6 +220,19 @@ pub async fn execute_rebalance(
         return Ok(RebalanceOutcome::Skipped);
     }
 
+    // Jupiter Ultra validates the LP's *native SOL wallet balance* for wSOL swaps,
+    // not the SPL token ATA balance. If the wallet has insufficient native SOL, close
+    // the wSOL ATA to convert it — the lamports flow to the owner's native wallet.
+    // TwoB's add_liquidity uses init_if_needed, so the ATA is recreated when needed.
+    let wsol_ata_closed = maybe_close_wsol_ata_for_jupiter(
+        program,
+        &input_mint,
+        &lp_input_ata,
+        swap_amount,
+        liquidity_provider.clone(),
+    )
+    .await?;
+
     let swap_execution = JupiterUltraClient::new(http_client, jupiter_config)
         .swap_exact_in(
             liquidity_provider.clone(),
@@ -235,7 +248,7 @@ pub async fn execute_rebalance(
             )
         })?;
 
-    let (deposit_base_lamports, deposit_quote_lamports) = match executed_plan.direction {
+    let (mut deposit_base_lamports, deposit_quote_lamports) = match executed_plan.direction {
         SwapDirection::BaseToQuote => (
             swap_amount.saturating_sub(swap_execution.input_consumed),
             swap_execution.output_received,
@@ -245,6 +258,18 @@ pub async fn execute_rebalance(
             swap_amount.saturating_sub(swap_execution.input_consumed),
         ),
     };
+
+    // If we closed the wSOL ATA and Jupiter didn't consume the full amount (rare),
+    // the unconsumed SOL sits in the native wallet. Skip the base deposit — it will
+    // be picked up by the next rebalance cycle once the cooldown expires.
+    if wsol_ata_closed && deposit_base_lamports > 0 {
+        eprintln!(
+            "[rebalance] wSOL ATA was closed but Jupiter left {} base lamports unconsumed — \
+             skipping base deposit (stays in native wallet)",
+            deposit_base_lamports,
+        );
+        deposit_base_lamports = 0;
+    }
 
     ensure!(
         deposit_base_lamports > 0 || deposit_quote_lamports > 0,
@@ -581,6 +606,71 @@ fn cap_rebalance_to_withdrawable(
     } else {
         Some(capped)
     }
+}
+
+/// Pubkey of the native SOL mint (wSOL).
+const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+/// Lamports kept in the native wallet to cover transaction fees when we close the ATA.
+const FEE_RESERVE_LAMPORTS: u64 = 10_000_000; // 0.01 SOL
+
+/// If `input_mint` is native SOL and the LP's wallet has insufficient native balance for
+/// the swap, close the wSOL ATA so the lamports flow to the native wallet.
+/// Returns `true` if the ATA was closed.
+async fn maybe_close_wsol_ata_for_jupiter(
+    program: &Program<Arc<Keypair>>,
+    input_mint: &anchor_client::solana_sdk::pubkey::Pubkey,
+    wsol_ata: &anchor_client::solana_sdk::pubkey::Pubkey,
+    swap_amount: u64,
+    signer: Arc<Keypair>,
+) -> anyhow::Result<bool> {
+    let native_mint: anchor_client::solana_sdk::pubkey::Pubkey =
+        NATIVE_SOL_MINT.parse().expect("hardcoded native mint");
+    if *input_mint != native_mint {
+        return Ok(false);
+    }
+
+    let lp_pubkey = signer.pubkey();
+    let native_balance = program
+        .rpc()
+        .get_balance(&lp_pubkey)
+        .await
+        .context("Failed to read LP native SOL balance")?;
+
+    println!(
+        "[jupiter] native SOL wallet: {} lamports (swap needs {} + {} fee reserve)",
+        native_balance, swap_amount, FEE_RESERVE_LAMPORTS,
+    );
+
+    if native_balance >= swap_amount + FEE_RESERVE_LAMPORTS {
+        return Ok(false);
+    }
+
+    println!(
+        "[jupiter] insufficient native SOL — closing wSOL ATA to convert lamports to native"
+    );
+    let close_ix = anchor_spl::token::spl_token::instruction::close_account(
+        &anchor_spl::token::spl_token::ID,
+        wsol_ata,
+        &lp_pubkey,
+        &lp_pubkey,
+        &[],
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to build close_account instruction: {e}"))?;
+
+    program
+        .request()
+        .instruction(close_ix)
+        .signer(signer.clone())
+        .send()
+        .await
+        .context("Failed to close wSOL ATA")?;
+
+    let new_native = program.rpc().get_balance(&lp_pubkey).await.unwrap_or(0);
+    println!(
+        "[jupiter] wSOL ATA closed — native SOL wallet now has {} lamports",
+        new_native,
+    );
+    Ok(true)
 }
 
 async fn read_ata_balance(

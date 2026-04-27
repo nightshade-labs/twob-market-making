@@ -25,7 +25,7 @@ pub struct Config {
     pub quote_threshold_bps: u64,
     pub flow_reduction_factor: f64,
     pub max_flow_reduction_attempts: usize,
-    pub rebalance_swap_delay_secs: u64,
+    pub rebalance_cooldown_secs: u64,
     pub jupiter: JupiterConfig,
 }
 
@@ -92,8 +92,8 @@ impl Config {
             .unwrap_or_else(|_| "200".to_string())
             .parse::<usize>()?;
 
-        let rebalance_swap_delay_secs = env::var("REBALANCE_SWAP_DELAY_SECS")
-            .unwrap_or_else(|_| "5".to_string())
+        let rebalance_cooldown_secs = env::var("REBALANCE_COOLDOWN_SECS")
+            .unwrap_or_else(|_| "60".to_string())
             .parse::<u64>()?;
 
         let jupiter = JupiterConfig {
@@ -127,7 +127,7 @@ impl Config {
             quote_threshold_bps,
             flow_reduction_factor,
             max_flow_reduction_attempts,
-            rebalance_swap_delay_secs,
+            rebalance_cooldown_secs,
             jupiter,
         })
     }

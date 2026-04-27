@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use anchor_client::{
     Program,
@@ -109,7 +109,6 @@ pub async fn execute_rebalance(
     jupiter_config: &JupiterConfig,
     _reduction_factor: f64,
     _max_reduction_attempts: usize,
-    swap_delay: Duration,
     is_devnet: bool,
 ) -> anyhow::Result<RebalanceOutcome> {
     if is_devnet {
@@ -215,14 +214,6 @@ pub async fn execute_rebalance(
         "[jupiter] ATA {} balance after withdrawal: intended={} actual={} using={}",
         lp_input_ata, intended_amount, actual_ata_balance, swap_amount,
     );
-
-    if swap_delay.as_secs() > 0 {
-        println!(
-            "[jupiter] waiting {}s before swap to allow withdrawal to propagate",
-            swap_delay.as_secs(),
-        );
-        tokio::time::sleep(swap_delay).await;
-    }
 
     if swap_amount == 0 {
         println!("[rebalance] ATA balance is 0 after withdrawal — skipping swap");

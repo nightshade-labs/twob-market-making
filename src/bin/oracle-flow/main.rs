@@ -4,7 +4,7 @@ mod price;
 mod quote;
 mod rebalance;
 
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::{Duration, Instant}};
 
 use anchor_client::{
     Client,
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let optimal_quote_weight = config.optimal_quote_weight;
     let flow_reduction_factor = config.flow_reduction_factor;
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
-    let rebalance_swap_delay = Duration::from_secs(config.rebalance_swap_delay_secs);
+    let rebalance_cooldown = Duration::from_secs(config.rebalance_cooldown_secs);
     let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
     let jupiter_config = config.jupiter.clone();
@@ -65,7 +65,9 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("Jupiter dry run: {}", jupiter_config.dry_run);
     println!("Devnet mode: {}", is_devnet);
-    println!("Rebalance swap delay: {}s", rebalance_swap_delay.as_secs());
+    println!("Rebalance cooldown: {}s", rebalance_cooldown.as_secs());
+
+    let mut last_rebalance_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -74,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = sleep(poll_interval) => {
-                if let Err(e) = run_update_cycle(
+                match run_update_cycle(
                     &program,
                     &http_client,
                     &price_feed_url,
@@ -85,14 +87,17 @@ async fn main() -> anyhow::Result<()> {
                     optimal_quote_weight,
                     flow_reduction_factor,
                     max_flow_reduction_attempts,
-                    rebalance_swap_delay,
+                    last_rebalance_at,
+                    rebalance_cooldown,
                     &jupiter_config,
                     is_devnet,
                     market_id,
                     &authority,
                     liquidity_provider.clone(),
                 ).await {
-                    eprintln!("Update cycle error: {:#}", e);
+                    Ok(Some(rebalanced_at)) => last_rebalance_at = Some(rebalanced_at),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("Update cycle error: {:#}", e),
                 }
             }
         }
@@ -113,13 +118,14 @@ async fn run_update_cycle(
     optimal_quote_weight: f64,
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
-    rebalance_swap_delay: Duration,
+    last_rebalance_at: Option<Instant>,
+    rebalance_cooldown: Duration,
     jupiter_config: &JupiterConfig,
     is_devnet: bool,
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Instant>> {
     let cycle_ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     println!("=== update cycle {} ===", cycle_ts);
 
@@ -143,7 +149,20 @@ async fn run_update_cycle(
     println!("[position] base_flow={} quote_flow={}", position.base_flow_u64, position.quote_flow_u64);
 
     // 3. Check if rebalance is needed
-    if needs_rebalance(
+    let mut new_rebalance_at: Option<Instant> = None;
+
+    let in_cooldown = last_rebalance_at
+        .map(|t| t.elapsed() < rebalance_cooldown)
+        .unwrap_or(false);
+
+    if in_cooldown {
+        let elapsed = last_rebalance_at.unwrap().elapsed();
+        println!(
+            "[rebalance] cooldown active — {}s elapsed of {}s required, skipping",
+            elapsed.as_secs(),
+            rebalance_cooldown.as_secs(),
+        );
+    } else if needs_rebalance(
         &price_data,
         &balances,
         base_token_decimals,
@@ -166,13 +185,14 @@ async fn run_update_cycle(
             jupiter_config,
             flow_reduction_factor,
             max_flow_reduction_attempts,
-            rebalance_swap_delay,
             is_devnet,
         )
         .await?;
 
         match rebalance_outcome {
             RebalanceOutcome::Executed => {
+                let now = Instant::now();
+                new_rebalance_at = Some(now);
                 // Re-fetch position data after rebalance
                 market_state = fetch_market_state(program, market_id).await?;
                 position = fetch_liquidity_position(program, market_id, authority).await?;
@@ -184,7 +204,10 @@ async fn run_update_cycle(
                     market_state.current_slot,
                 )
                 .await;
-                println!("[rebalance] completed — position data refreshed");
+                println!(
+                    "[rebalance] completed — cooldown of {}s starts now",
+                    rebalance_cooldown.as_secs(),
+                );
             }
             RebalanceOutcome::Skipped => {
                 println!("[rebalance] skipped (see reason above)");
@@ -250,7 +273,7 @@ async fn run_update_cycle(
         );
     }
 
-    Ok(())
+    Ok(new_rebalance_at)
 }
 
 #[allow(clippy::too_many_arguments)]

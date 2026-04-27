@@ -116,9 +116,12 @@ async fn run_update_cycle(
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
 ) -> anyhow::Result<()> {
+    let cycle_ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    println!("=== update cycle {} ===", cycle_ts);
+
     // 1. Fetch external price
     let price_data = fetch_price(http_client, price_feed_url).await?;
-    println!("Fetched price: {}", price_data.price);
+    println!("[price] oracle={:.6}", price_data.price);
 
     // 2. Fetch liquidity position and market state
     let mut market_state = fetch_market_state(program, market_id).await?;
@@ -132,8 +135,8 @@ async fn run_update_cycle(
     )
     .await;
 
-    println!("Market state {:?}", market_state.market);
-    println!("Position {:?}", position);
+    println!("[market] base_flow={} quote_flow={} end_slot_interval={}", market_state.market.base_flow, market_state.market.quote_flow, market_state.market.end_slot_interval);
+    println!("[position] base_flow={} quote_flow={}", position.base_flow_u64, position.quote_flow_u64);
 
     // 3. Check if rebalance is needed
     if needs_rebalance(
@@ -202,8 +205,10 @@ async fn run_update_cycle(
         quote_threshold_bps,
     ) {
         println!(
-            "Quote deviation exceeds threshold. Updating flows: base={} quote={}",
-            optimal.base_flow, optimal.quote_flow
+            "[update] deviation exceeds {} bps — updating flows: base {} -> {} quote {} -> {}",
+            quote_threshold_bps,
+            current_base_flow, optimal.base_flow,
+            current_quote_flow, optimal.quote_flow,
         );
 
         let reference_index = (market_state.current_slot + ARRAY_LENGTH / 2)
@@ -227,7 +232,10 @@ async fn run_update_cycle(
             final_base_flow, final_quote_flow
         );
     } else {
-        println!("Quote within threshold, no update needed");
+        println!(
+            "[update] within {} bps threshold — no update (base={} quote={})",
+            quote_threshold_bps, current_base_flow, current_quote_flow,
+        );
     }
 
     Ok(())

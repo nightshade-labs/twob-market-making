@@ -35,8 +35,17 @@ pub fn calculate_optimal_quote(
         return fallback;
     }
 
-    let lp_price = liquidity_position_price(balances, base_token_decimals, quote_token_decimals);
-    let market_price = market_price_excluding_position(
+    let Some(inventory_price) =
+        liquidity_position_price(balances, base_token_decimals, quote_token_decimals)
+    else {
+        eprintln!(
+            "[quote] Liquidity-position price unavailable (base={} quote={}). Keeping current quote.",
+            balances.base_balance, balances.quote_balance,
+        );
+        return fallback;
+    };
+
+    let _market_price = market_price_excluding_position(
         position,
         market_state,
         base_token_decimals,
@@ -44,18 +53,9 @@ pub fn calculate_optimal_quote(
     );
 
     let normalized_weight = sanitize_weight(weight);
-    let target_quote_price = match lp_price {
-        Some(position_price) => {
-            // Weighted blend between oracle and inventory-implied price.
-            (oracle_price + normalized_weight * position_price) / (1.0 + normalized_weight)
-        }
-        None => oracle_price,
-    };
-
-    let Some(inventory_price) = lp_price else {
-        eprintln!("Liquidity-position price is unavailable. Keeping current quote.");
-        return fallback;
-    };
+    // Weighted blend between oracle and inventory-implied price.
+    let target_quote_price =
+        (oracle_price + normalized_weight * inventory_price) / (1.0 + normalized_weight);
 
     let Some(target_flows) = compute_target_flows(
         balances,
@@ -64,20 +64,25 @@ pub fn calculate_optimal_quote(
         base_token_decimals,
         quote_token_decimals,
     ) else {
-        eprintln!("Failed to compute inventory-constrained flows. Keeping current quote.");
+        eprintln!(
+            "[quote] Failed to compute inventory-constrained flows \
+             (base={} quote={} target_price={:.6}). Keeping current quote.",
+            balances.base_balance, balances.quote_balance, target_quote_price,
+        );
         return fallback;
     };
 
     println!(
-        "Quote calc: oracle_price={} lp_price={:?} market_price={:?} weight={} target_quote_price={} inventory_price={} target_base_flow={} target_quote_flow={}",
+        "[quote] oracle={:.6} inventory={:.6} weight={:.3} target={:.6} \
+         base_flow={} quote_flow={} (prev base={} quote={})",
         oracle_price,
-        lp_price,
-        market_price,
+        inventory_price,
         normalized_weight,
         target_quote_price,
-        inventory_price,
         target_flows.base_flow,
-        target_flows.quote_flow
+        target_flows.quote_flow,
+        position.base_flow_u64,
+        position.quote_flow_u64,
     );
 
     target_flows

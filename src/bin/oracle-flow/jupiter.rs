@@ -54,6 +54,15 @@ impl<'a> JupiterUltraClient<'a> {
         output_mint: Pubkey,
         amount: u64,
     ) -> anyhow::Result<SwapExecution> {
+        println!(
+            "[jupiter] swap_exact_in: {} -> {} amount={} dry_run={} api_key_set={}",
+            input_mint,
+            output_mint,
+            amount,
+            self.config.dry_run,
+            self.config.api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false),
+        );
+
         let api_key = self
             .config
             .api_key

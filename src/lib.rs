@@ -56,32 +56,48 @@ pub async fn get_liquidity_position_balances(
     let resolver = AccountResolver::new(twob_anchor::ID);
     let market_pda = resolver.market_pda(market.id);
 
-    let inactive_slots =
-        bookkeeping.slots_without_trade - liquidity_position.slots_without_trade_snapshot;
+    let elapsed_slots = current_slot - liquidity_position.last_update_slot;
+    let raw_inactive = bookkeeping
+        .slots_without_trade
+        .saturating_sub(liquidity_position.slots_without_trade_snapshot);
+    let active_slots = elapsed_slots.saturating_sub(raw_inactive);
 
-    // For debugging since sometimes it failed because substraction overflow
     println!(
-        "Base balances {:?} | Base debt {:?} | Quote balances {:?} | Quote debt {:?}",
+        "[balances] slot: current={} lp_last_update={} elapsed={} inactive={} active={}",
+        current_slot,
+        liquidity_position.last_update_slot,
+        elapsed_slots,
+        raw_inactive,
+        active_slots,
+    );
+    if raw_inactive > elapsed_slots {
+        eprintln!(
+            "[balances] WARNING: inactive_slots ({}) > elapsed_slots ({}) — saturated to zero. \
+             bookkeeping.slots_without_trade={} lp.slots_without_trade_snapshot={}",
+            raw_inactive,
+            elapsed_slots,
+            bookkeeping.slots_without_trade,
+            liquidity_position.slots_without_trade_snapshot,
+        );
+    }
+    println!(
+        "[balances] on-chain: base={} base_debt={} quote={} quote_debt={} base_flow={} quote_flow={}",
         liquidity_position.base_balance,
         liquidity_position.base_debt,
         liquidity_position.quote_balance,
-        liquidity_position.quote_debt
+        liquidity_position.quote_debt,
+        liquidity_position.base_flow_u64,
+        liquidity_position.quote_flow_u64,
     );
 
-    println!("Current slot {}", current_slot);
-    println!(
-        "LP last update slot {}",
-        liquidity_position.last_update_slot
-    );
-    println!("Inactive slots {}", inactive_slots);
     // Base token outflow since last update slot
     let accumulated_base_outflow = BOOKKEEPING_PRECISION_FACTOR
-        * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
+        * active_slots as u128
         * liquidity_position.base_flow_u64 as u128;
 
     // Quote token outflow since last update slot
     let accumulated_quote_outflow = BOOKKEEPING_PRECISION_FACTOR
-        * (current_slot - liquidity_position.last_update_slot - inactive_slots) as u128
+        * active_slots as u128
         * liquidity_position.quote_flow_u64 as u128;
 
     // Cacluclation token inflow is a bit tricky since we only have data up to bookkeeping last update slot.
@@ -233,6 +249,14 @@ pub async fn get_liquidity_position_balances(
     let accumulated_quote_inflow = (quote_per_base - liquidity_position.quote_per_base_snapshot)
         * liquidity_position.base_flow_u64 as u128;
 
+    println!(
+        "[balances] flows (scaled): base_outflow={} base_inflow={} quote_outflow={} quote_inflow={}",
+        accumulated_base_outflow / BOOKKEEPING_PRECISION_FACTOR,
+        accumulated_base_inflow / BOOKKEEPING_PRECISION_FACTOR,
+        accumulated_quote_outflow / BOOKKEEPING_PRECISION_FACTOR,
+        accumulated_quote_inflow / BOOKKEEPING_PRECISION_FACTOR,
+    );
+
     let base_balance;
     let base_debt;
     if accumulated_base_outflow > liquidity_position.base_balance + accumulated_base_inflow {
@@ -261,6 +285,11 @@ pub async fn get_liquidity_position_balances(
             / BOOKKEEPING_PRECISION_FACTOR;
         quote_debt = 0;
     }
+
+    println!(
+        "[balances] computed: base={} base_debt={} quote={} quote_debt={}",
+        base_balance, base_debt, quote_balance, quote_debt,
+    );
 
     LiquidityPositionBalances {
         base_balance: base_balance as u64,

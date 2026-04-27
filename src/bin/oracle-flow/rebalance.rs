@@ -197,12 +197,35 @@ pub async fn execute_rebalance(
         ),
     };
 
+    // Read the LP's actual ATA balance after withdrawal. The withdraw tx is submitted but
+    // may not be confirmed by the time Jupiter queries it, so the confirmed on-chain
+    // balance is the ground truth for what Jupiter can actually spend.
+    let input_token_program = get_token_program_id(program, &input_mint).await?;
+    let lp_input_ata = get_associated_token_address_with_program_id(
+        &liquidity_provider.pubkey(),
+        &input_mint,
+        &input_token_program,
+    );
+    let actual_ata_balance = read_ata_balance(program, &lp_input_ata).await?;
+    let intended_amount = executed_plan.input_amount();
+    let swap_amount = actual_ata_balance.min(intended_amount);
+
+    println!(
+        "[jupiter] ATA {} balance after withdrawal: intended={} actual={} using={}",
+        lp_input_ata, intended_amount, actual_ata_balance, swap_amount,
+    );
+
+    if swap_amount == 0 {
+        println!("[rebalance] ATA balance is 0 after withdrawal — skipping swap");
+        return Ok(RebalanceOutcome::Skipped);
+    }
+
     let swap_execution = JupiterUltraClient::new(http_client, jupiter_config)
         .swap_exact_in(
             liquidity_provider.clone(),
             input_mint,
             output_mint,
-            executed_plan.input_amount(),
+            swap_amount,
         )
         .await
         .with_context(|| {
@@ -214,16 +237,12 @@ pub async fn execute_rebalance(
 
     let (deposit_base_lamports, deposit_quote_lamports) = match executed_plan.direction {
         SwapDirection::BaseToQuote => (
-            executed_plan
-                .withdraw_base_lamports
-                .saturating_sub(swap_execution.input_consumed),
+            swap_amount.saturating_sub(swap_execution.input_consumed),
             swap_execution.output_received,
         ),
         SwapDirection::QuoteToBase => (
             swap_execution.output_received,
-            executed_plan
-                .withdraw_quote_lamports
-                .saturating_sub(swap_execution.input_consumed),
+            swap_amount.saturating_sub(swap_execution.input_consumed),
         ),
     };
 
@@ -562,6 +581,20 @@ fn cap_rebalance_to_withdrawable(
     } else {
         Some(capped)
     }
+}
+
+async fn read_ata_balance(
+    program: &Program<Arc<Keypair>>,
+    token_account: &anchor_client::solana_sdk::pubkey::Pubkey,
+) -> anyhow::Result<u64> {
+    let account = program
+        .rpc()
+        .get_account(token_account)
+        .await
+        .with_context(|| format!("Failed to fetch ATA {}", token_account))?;
+    let state = SplTokenAccount::unpack(&account.data)
+        .with_context(|| format!("Failed to decode ATA {}", token_account))?;
+    Ok(state.amount)
 }
 
 fn ui_amount_to_lamports(amount_ui: f64, decimals: u8) -> u64 {

@@ -20,7 +20,7 @@ use twob_anchor::accounts::{Bookkeeping, LiquidityPosition, Market};
 use crate::twob_anchor::accounts::Exits;
 
 /// The TwoB Anchor program ID
-pub const TWOB_PROGRAM_ID: &str = "DkjFmy1YNDDDaXoy3ZvuCnpb294UDbpbT457gUyiFS5V";
+pub const TWOB_PROGRAM_ID: &str = "CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5";
 
 /// Parse the program ID from the constant string
 pub fn program_id() -> anchor_lang::prelude::Pubkey {

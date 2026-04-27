@@ -60,7 +60,11 @@ impl<'a> JupiterUltraClient<'a> {
             output_mint,
             amount,
             self.config.dry_run,
-            self.config.api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false),
+            self.config
+                .api_key
+                .as_deref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false),
         );
 
         let api_key = self
@@ -80,7 +84,8 @@ impl<'a> JupiterUltraClient<'a> {
                     let delay = Duration::from_secs(2u64.pow(attempt));
                     eprintln!(
                         "[jupiter] order error on attempt {} — waiting {}s before retry",
-                        attempt, delay.as_secs(),
+                        attempt,
+                        delay.as_secs(),
                     );
                     tokio::time::sleep(delay).await;
                 }

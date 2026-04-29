@@ -109,21 +109,24 @@ pub struct TelemetryGuard {
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.logger_provider.take()
-            && let Err(error) = provider.shutdown()
-        {
-            warn!(event.name = "telemetry_shutdown_error", telemetry.signal = "logs", %error);
+        if let Some(provider) = self.logger_provider.take() {
+            log_shutdown_result("logs", provider.shutdown());
         }
-        if let Some(provider) = self.meter_provider.take()
-            && let Err(error) = provider.shutdown()
-        {
-            warn!(event.name = "telemetry_shutdown_error", telemetry.signal = "metrics", %error);
+        if let Some(provider) = self.meter_provider.take() {
+            log_shutdown_result("metrics", provider.shutdown());
         }
-        if let Some(provider) = self.tracer_provider.take()
-            && let Err(error) = provider.shutdown()
-        {
-            warn!(event.name = "telemetry_shutdown_error", telemetry.signal = "traces", %error);
+        if let Some(provider) = self.tracer_provider.take() {
+            log_shutdown_result("traces", provider.shutdown());
         }
+    }
+}
+
+fn log_shutdown_result<E: std::fmt::Display>(
+    signal: &'static str,
+    result: std::result::Result<(), E>,
+) {
+    if let Err(error) = result {
+        warn!(event.name = "telemetry_shutdown_error", telemetry.signal = signal, %error);
     }
 }
 

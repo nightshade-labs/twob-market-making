@@ -28,6 +28,7 @@ use twob_market_making::{
 };
 
 const LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE: u32 = 6013;
+const BALANCED_QUOTE_VALUE_WEIGHT: f64 = 0.5;
 type OracleProgram = anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>;
 
 #[tokio::main]
@@ -217,7 +218,6 @@ async fn run_update_cycle(
         base_token_decimals,
         quote_token_decimals,
         price_data.price,
-        optimal_quote_weight,
     );
 
     // 3. Check if rebalance is needed
@@ -508,7 +508,6 @@ async fn run_update_cycle(
         base_token_decimals,
         quote_token_decimals,
         price_data.price,
-        optimal_quote_weight,
     );
     info!(
         event.name = "oracle_flow_cycle_end",
@@ -553,7 +552,6 @@ fn emit_position_snapshot(
     base_token_decimals: u8,
     quote_token_decimals: u8,
     oracle_price: f64,
-    optimal_quote_weight: f64,
 ) {
     let base_ui = telemetry::token_amount_ui(balances.base_balance, base_token_decimals);
     let quote_ui = telemetry::token_amount_ui(balances.quote_balance, quote_token_decimals);
@@ -563,7 +561,8 @@ fn emit_position_snapshot(
     } else {
         0.0
     };
-    let inventory_deviation_bps = ((quote_weight - optimal_quote_weight).abs() * 10_000.0).round();
+    let inventory_deviation_bps =
+        ((quote_weight - BALANCED_QUOTE_VALUE_WEIGHT).abs() * 10_000.0).round();
 
     info!(
         event.name = "position_balance_snapshot",
@@ -584,6 +583,7 @@ fn emit_position_snapshot(
         market.quote_flow.raw = market_state.market.quote_flow,
         market.end_slot_interval = market_state.market.end_slot_interval,
         inventory.quote_weight = quote_weight,
+        inventory.quote_weight_target = BALANCED_QUOTE_VALUE_WEIGHT,
         gauge.position_base_balance_raw = balances.base_balance as f64,
         gauge.position_quote_balance_raw = balances.quote_balance as f64,
         gauge.inventory_deviation_bps = inventory_deviation_bps,

@@ -47,21 +47,6 @@ impl RebalancePlan {
             SwapDirection::QuoteToBase => self.withdraw_quote_lamports,
         }
     }
-
-    fn with_input_amount(self, amount: u64) -> Self {
-        match self.direction {
-            SwapDirection::BaseToQuote => Self {
-                withdraw_base_lamports: amount,
-                withdraw_quote_lamports: 0,
-                ..self
-            },
-            SwapDirection::QuoteToBase => Self {
-                withdraw_base_lamports: 0,
-                withdraw_quote_lamports: amount,
-                ..self
-            },
-        }
-    }
 }
 
 /// Check if inventory needs rebalancing based on price and current balances.
@@ -266,8 +251,9 @@ pub async fn execute_rebalance(
         &liquidity_provider.pubkey(),
     )
     .await?;
-    let withdraw_amount = target_swap_amount.saturating_sub(existing_input_balance);
-    let withdraw_plan = plan.with_input_amount(withdraw_amount);
+    let input_ata_balance_before = read_ata_balance_or_zero(program, &lp_input_ata).await?;
+    let withdraw_amount = target_swap_amount;
+    let withdraw_plan = plan;
 
     info!(
         event.name = "rebalance_execution_planned",
@@ -278,6 +264,7 @@ pub async fn execute_rebalance(
         rebalance.direction = plan.direction.label(),
         rebalance.planned_input.raw = target_swap_amount,
         rebalance.wallet_input_before.raw = existing_input_balance,
+        rebalance.input_ata_before.raw = input_ata_balance_before,
         rebalance.withdrawn_input.raw = withdraw_amount,
         rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
         rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
@@ -303,42 +290,43 @@ pub async fn execute_rebalance(
     )
     .await;
 
-    if withdraw_amount > 0 {
-        let withdraw_reference_index =
-            oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
-        execute_exact_withdraw_liquidity(
-            program,
-            market_id,
-            withdraw_reference_index,
-            liquidity_provider.clone(),
-            withdraw_plan,
-        )
-        .instrument(info_span!(
-            "twob.withdraw_liquidity",
-            cycle.id = %cycle_id,
-            market.id = market_id,
-            lp.authority = %liquidity_provider.pubkey(),
-            rebalance.attempt_id = %attempt_id,
-            twob.instruction = "withdraw_liquidity",
-            twob.reference_index = withdraw_reference_index,
-            rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
-            rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
-        ))
-        .await
-        .context("Failed to withdraw liquidity for rebalance")?;
-    } else {
+    if existing_input_balance > dust_threshold_for_mint(&input_mint) {
         warn!(
-            event.name = "rebalance_using_existing_wallet_input",
+            event.name = "rebalance_ignoring_existing_wallet_input",
             cycle.id = %cycle_id,
             market.id = market_id,
             lp.authority = %liquidity_provider.pubkey(),
             rebalance.attempt_id = %attempt_id,
             rebalance.direction = plan.direction.label(),
             rebalance.wallet_input_before.raw = existing_input_balance,
+            rebalance.input_ata_before.raw = input_ata_balance_before,
             rebalance.planned_input.raw = target_swap_amount,
-            "using existing wallet input balance; no additional withdraw needed"
+            "existing wallet input is ignored; rebalance will only swap freshly withdrawn liquidity"
         );
     }
+
+    let withdraw_reference_index =
+        oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
+    execute_exact_withdraw_liquidity(
+        program,
+        market_id,
+        withdraw_reference_index,
+        liquidity_provider.clone(),
+        withdraw_plan,
+    )
+    .instrument(info_span!(
+        "twob.withdraw_liquidity",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        twob.instruction = "withdraw_liquidity",
+        twob.reference_index = withdraw_reference_index,
+        rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
+        rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
+    ))
+    .await
+    .context("Failed to withdraw liquidity for rebalance")?;
 
     log_wallet_balance_snapshot(
         program,
@@ -352,16 +340,19 @@ pub async fn execute_rebalance(
     )
     .await;
 
-    let expected_input_balance = existing_input_balance.saturating_add(withdraw_amount);
-    let actual_input_balance = wait_for_swap_input_balance(
-        program,
-        &input_mint,
-        &lp_input_ata,
-        &liquidity_provider.pubkey(),
-        expected_input_balance.min(target_swap_amount),
-    )
-    .await?;
-    let swap_amount = actual_input_balance.min(target_swap_amount);
+    let expected_input_ata_balance = input_ata_balance_before
+        .checked_add(withdraw_amount)
+        .context("input ATA balance expectation overflowed")?;
+    let input_ata_balance_after =
+        wait_for_ata_balance_at_least(program, &lp_input_ata, expected_input_ata_balance).await?;
+    ensure!(
+        input_ata_balance_after >= expected_input_ata_balance,
+        "Withdrawn input did not settle in ATA: before={} expected_after={} actual_after={}",
+        input_ata_balance_before,
+        expected_input_ata_balance,
+        input_ata_balance_after
+    );
+    let swap_amount = withdraw_amount;
 
     info!(
         event.name = "rebalance_input_balance_ready",
@@ -370,7 +361,8 @@ pub async fn execute_rebalance(
         lp.authority = %liquidity_provider.pubkey(),
         rebalance.attempt_id = %attempt_id,
         rebalance.planned_input.raw = target_swap_amount,
-        rebalance.actual_input_balance.raw = actual_input_balance,
+        rebalance.input_ata_before.raw = input_ata_balance_before,
+        rebalance.input_ata_after.raw = input_ata_balance_after,
         rebalance.swap_input_requested.raw = swap_amount,
     );
 
@@ -453,8 +445,7 @@ pub async fn execute_rebalance(
     )
     .await;
 
-    let prior_pending_input = 0_u64;
-    let available_budget = withdraw_amount.saturating_add(prior_pending_input);
+    let available_budget = withdraw_amount;
     let external_wallet_input_estimated =
         telemetry::external_wallet_input_estimated(swap_execution.input_consumed, available_budget);
     info!(
@@ -466,7 +457,6 @@ pub async fn execute_rebalance(
         rebalance.direction = plan.direction.label(),
         rebalance.available_budget.raw = available_budget,
         rebalance.withdrawn_input.raw = withdraw_amount,
-        rebalance.prior_pending_input.raw = prior_pending_input,
         rebalance.wallet_input_before.raw = existing_input_balance,
         rebalance.swap_input_requested.raw = swap_amount,
         jupiter.input_consumed.raw = swap_execution.input_consumed,
@@ -1193,26 +1183,6 @@ async fn read_swap_input_balance(
     }
 
     read_ata_balance_or_zero(program, input_ata).await
-}
-
-async fn wait_for_swap_input_balance(
-    program: &Program<Arc<Keypair>>,
-    input_mint: &Pubkey,
-    input_ata: &Pubkey,
-    owner: &Pubkey,
-    expected_amount: u64,
-) -> anyhow::Result<u64> {
-    let mut last_balance = 0;
-    for attempt in 0..BALANCE_POLL_ATTEMPTS {
-        last_balance = read_swap_input_balance(program, input_mint, input_ata, owner).await?;
-        if last_balance >= expected_amount {
-            return Ok(last_balance);
-        }
-        if attempt + 1 < BALANCE_POLL_ATTEMPTS {
-            sleep(BALANCE_POLL_DELAY).await;
-        }
-    }
-    Ok(last_balance)
 }
 
 async fn wait_for_ata_balance_at_least(

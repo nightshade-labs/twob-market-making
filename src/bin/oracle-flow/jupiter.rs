@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anchor_client::solana_sdk::{
     pubkey::Pubkey,
@@ -8,6 +11,7 @@ use anchor_client::solana_sdk::{
 use anyhow::{Context, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
+use tracing::{Instrument, info, info_span, warn};
 
 use crate::config::JupiterConfig;
 
@@ -26,11 +30,15 @@ impl SwapDirection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwapExecution {
     pub input_consumed: u64,
     pub output_received: u64,
     pub signature: Option<String>,
+    pub request_id: Option<String>,
+    pub router: Option<String>,
+    pub slippage_bps: Option<u64>,
+    pub price_impact_bps: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -54,16 +62,17 @@ impl<'a> JupiterUltraClient<'a> {
         output_mint: Pubkey,
         amount: u64,
     ) -> anyhow::Result<SwapExecution> {
-        println!(
-            "[jupiter] swap_exact_in: {} -> {} amount={} dry_run={} api_key_set={}",
-            input_mint,
-            output_mint,
-            amount,
-            self.config.dry_run,
-            self.config
+        info!(
+            event.name = "jupiter_swap_requested",
+            jupiter.input_mint = %input_mint,
+            jupiter.output_mint = %output_mint,
+            rebalance.swap_input_requested.raw = amount,
+            jupiter.dry_run = self.config.dry_run,
+            jupiter.api_key_configured = self
+                .config
                 .api_key
                 .as_deref()
-                .map(|k| !k.trim().is_empty())
+                .map(|key| !key.trim().is_empty())
                 .unwrap_or(false),
         );
 
@@ -82,10 +91,11 @@ impl<'a> JupiterUltraClient<'a> {
             for attempt in 0..MAX_ORDER_RETRIES {
                 if attempt > 0 {
                     let delay = Duration::from_secs(2u64.pow(attempt));
-                    eprintln!(
-                        "[jupiter] order error on attempt {} — waiting {}s before retry",
-                        attempt,
-                        delay.as_secs(),
+                    warn!(
+                        event.name = "jupiter_order_retry",
+                        jupiter.order_attempt = attempt + 1,
+                        jupiter.retry_delay_secs = delay.as_secs(),
+                        "Jupiter order returned insufficient funds; retrying after delay"
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -104,10 +114,24 @@ impl<'a> JupiterUltraClient<'a> {
                             },
                         },
                     )
+                    .instrument(info_span!(
+                        "jupiter.order",
+                        jupiter.input_mint = %input_mint,
+                        jupiter.output_mint = %output_mint,
+                        rebalance.swap_input_requested.raw = amount,
+                        jupiter.order_attempt = attempt + 1,
+                    ))
                     .await;
 
                 match order {
                     Ok(o) if o.error_code == Some(1) => {
+                        warn!(
+                            event.name = "jupiter_order_rejected",
+                            jupiter.error_code = 1_u64,
+                            jupiter.error_message =
+                                o.error_message.as_deref().unwrap_or("Insufficient funds"),
+                            jupiter.order_attempt = attempt + 1,
+                        );
                         last_err = anyhow::anyhow!(
                             "Jupiter order returned error 1: {} (attempt {})",
                             o.error_message.as_deref().unwrap_or("Insufficient funds"),
@@ -122,14 +146,25 @@ impl<'a> JupiterUltraClient<'a> {
         };
 
         order.validate(input_mint, output_mint, amount, self.config)?;
+        info!(
+            event.name = "jupiter_order_received",
+            jupiter.request_id = ?order.request_id,
+            jupiter.router = ?order.router,
+            jupiter.slippage_bps = ?order.slippage_bps,
+            jupiter.price_impact_bps = ?order.price_impact_bps(),
+            jupiter.expected_output.raw = ?order.out_amount,
+            monotonic_counter.jupiter_orders_total = 1_u64,
+        );
 
         if self.config.dry_run {
             let preview = order
                 .dry_run_execution(amount)
                 .context("Failed to derive Jupiter dry-run swap result from order response")?;
-            println!(
-                "Jupiter dry run preview: input_consumed={} output_received={} signature=None (execute skipped)",
-                preview.input_consumed, preview.output_received
+            info!(
+                event.name = "jupiter_dry_run_preview",
+                jupiter.input_consumed.raw = preview.input_consumed,
+                jupiter.output_received.raw = preview.output_received,
+                jupiter.signature = "None",
             );
             return Ok(preview);
         }
@@ -147,6 +182,11 @@ impl<'a> JupiterUltraClient<'a> {
         let signed_transaction = sign_transaction(&transaction, liquidity_provider)?;
         let execute_response = self
             .execute_order(api_key, &request_id, &signed_transaction)
+            .instrument(info_span!(
+                "jupiter.execute",
+                jupiter.request_id = %request_id,
+                jupiter.router = ?order.router,
+            ))
             .await?;
         execute_response.validate()?;
 
@@ -176,6 +216,10 @@ impl<'a> JupiterUltraClient<'a> {
             input_consumed,
             output_received,
             signature: execute_response.signature,
+            request_id: Some(request_id),
+            router: order.router.clone(),
+            slippage_bps: order.slippage_bps,
+            price_impact_bps: order.price_impact_bps(),
         })
     }
 
@@ -188,6 +232,7 @@ impl<'a> JupiterUltraClient<'a> {
             "{}/order",
             self.config.ultra_api_base_url.trim_end_matches('/')
         );
+        let started_at = Instant::now();
         let response = self
             .http_client
             .get(&url)
@@ -196,6 +241,12 @@ impl<'a> JupiterUltraClient<'a> {
             .send()
             .await
             .context("Failed to request Jupiter Ultra order")?;
+        let status = response.status();
+        info!(
+            event.name = "jupiter_order_http_response",
+            http.status_code = status.as_u16(),
+            histogram.jupiter_order_latency_ms = started_at.elapsed().as_millis() as f64,
+        );
 
         parse_json_response(response, "Jupiter Ultra order").await
     }
@@ -210,6 +261,7 @@ impl<'a> JupiterUltraClient<'a> {
             "{}/execute",
             self.config.ultra_api_base_url.trim_end_matches('/')
         );
+        let started_at = Instant::now();
         let response = self
             .http_client
             .post(&url)
@@ -221,6 +273,13 @@ impl<'a> JupiterUltraClient<'a> {
             .send()
             .await
             .context("Failed to execute Jupiter Ultra order")?;
+        let status = response.status();
+        info!(
+            event.name = "jupiter_execute_http_response",
+            jupiter.request_id = %request_id,
+            http.status_code = status.as_u16(),
+            histogram.jupiter_execute_latency_ms = started_at.elapsed().as_millis() as f64,
+        );
 
         parse_json_response(response, "Jupiter Ultra execute").await
     }
@@ -369,10 +428,7 @@ impl OrderResponse {
             config.max_slippage_bps
         );
 
-        let price_impact_bps = self
-            .price_impact
-            .map(|value| value.abs() * 100.0)
-            .unwrap_or_default();
+        let price_impact_bps = self.price_impact_bps().unwrap_or_default();
         ensure!(
             price_impact_bps <= config.max_price_impact_bps as f64,
             "Jupiter order price impact {:.2} bps exceeds configured max {} bps",
@@ -380,12 +436,20 @@ impl OrderResponse {
             config.max_price_impact_bps
         );
 
-        println!(
-            "Jupiter order accepted: router={:?} slippage_bps={} price_impact_bps={:.2} expected_out={:?}",
-            self.router, slippage_bps, price_impact_bps, self.out_amount
+        info!(
+            event.name = "jupiter_order_accepted",
+            jupiter.request_id = ?self.request_id,
+            jupiter.router = ?self.router,
+            jupiter.slippage_bps = slippage_bps,
+            jupiter.price_impact_bps = price_impact_bps,
+            jupiter.expected_output.raw = ?self.out_amount,
         );
 
         Ok(())
+    }
+
+    fn price_impact_bps(&self) -> Option<f64> {
+        self.price_impact.map(|value| value.abs() * 100.0)
     }
 
     fn dry_run_execution(&self, requested_amount: u64) -> anyhow::Result<SwapExecution> {
@@ -417,6 +481,10 @@ impl OrderResponse {
             input_consumed,
             output_received,
             signature: None,
+            request_id: self.request_id.clone(),
+            router: self.router.clone(),
+            slippage_bps: self.slippage_bps,
+            price_impact_bps: self.price_impact_bps(),
         })
     }
 }

@@ -1,3 +1,4 @@
+use tracing::{info, warn};
 use twob_market_making::FLOW_PRECISION;
 use twob_market_making::{
     LiquidityPositionBalances, MarketState, twob_anchor::accounts::LiquidityPosition,
@@ -28,9 +29,10 @@ pub fn calculate_optimal_quote(
 
     let oracle_price = price.price;
     if !oracle_price.is_finite() || oracle_price <= 0.0 {
-        eprintln!(
-            "Oracle price is invalid ({}). Keeping current quote.",
-            oracle_price
+        warn!(
+            event.name = "quote_compute_fallback",
+            quote.reason = "invalid_oracle_price",
+            price.oracle = oracle_price,
         );
         return fallback;
     }
@@ -38,9 +40,11 @@ pub fn calculate_optimal_quote(
     let Some(inventory_price) =
         liquidity_position_price(balances, base_token_decimals, quote_token_decimals)
     else {
-        eprintln!(
-            "[quote] Liquidity-position price unavailable (base={} quote={}). Keeping current quote.",
-            balances.base_balance, balances.quote_balance,
+        warn!(
+            event.name = "quote_compute_fallback",
+            quote.reason = "liquidity_position_price_unavailable",
+            position.base_balance.raw = balances.base_balance,
+            position.quote_balance.raw = balances.quote_balance,
         );
         return fallback;
     };
@@ -64,25 +68,26 @@ pub fn calculate_optimal_quote(
         base_token_decimals,
         quote_token_decimals,
     ) else {
-        eprintln!(
-            "[quote] Failed to compute inventory-constrained flows \
-             (base={} quote={} target_price={:.6}). Keeping current quote.",
-            balances.base_balance, balances.quote_balance, target_quote_price,
+        warn!(
+            event.name = "quote_compute_fallback",
+            quote.reason = "target_flow_compute_failed",
+            position.base_balance.raw = balances.base_balance,
+            position.quote_balance.raw = balances.quote_balance,
+            quote.target_price = target_quote_price,
         );
         return fallback;
     };
 
-    println!(
-        "[quote] oracle={:.6} inventory={:.6} weight={:.3} target={:.6} \
-         base_flow={} quote_flow={} (prev base={} quote={})",
-        oracle_price,
-        inventory_price,
-        normalized_weight,
-        target_quote_price,
-        target_flows.base_flow,
-        target_flows.quote_flow,
-        position.base_flow_u64,
-        position.quote_flow_u64,
+    info!(
+        event.name = "quote_computed",
+        price.oracle = oracle_price,
+        price.inventory = inventory_price,
+        quote.weight = normalized_weight,
+        quote.target_price = target_quote_price,
+        quote.target_base_flow = target_flows.base_flow,
+        quote.target_quote_flow = target_flows.quote_flow,
+        quote.previous_base_flow = position.base_flow_u64,
+        quote.previous_quote_flow = position.quote_flow_u64,
     );
 
     target_flows

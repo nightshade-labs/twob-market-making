@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anchor_client::{Program, solana_sdk::signature::Keypair};
 use anchor_lang::prelude::*;
+use tracing::{info, warn};
 
 pub mod accounts;
 pub mod constants;
@@ -62,32 +63,31 @@ pub async fn get_liquidity_position_balances(
         .saturating_sub(liquidity_position.slots_without_trade_snapshot);
     let active_slots = elapsed_slots.saturating_sub(raw_inactive);
 
-    println!(
-        "[balances] slot: current={} lp_last_update={} elapsed={} inactive={} active={}",
-        current_slot,
-        liquidity_position.last_update_slot,
-        elapsed_slots,
-        raw_inactive,
-        active_slots,
+    info!(
+        event.name = "liquidity_position_balance_slots",
+        slot.current = current_slot,
+        lp.last_update_slot = liquidity_position.last_update_slot,
+        lp.elapsed_slots = elapsed_slots,
+        lp.inactive_slots = raw_inactive,
+        lp.active_slots = active_slots,
     );
     if raw_inactive > elapsed_slots {
-        eprintln!(
-            "[balances] WARNING: inactive_slots ({}) > elapsed_slots ({}) — saturated to zero. \
-             bookkeeping.slots_without_trade={} lp.slots_without_trade_snapshot={}",
-            raw_inactive,
-            elapsed_slots,
-            bookkeeping.slots_without_trade,
-            liquidity_position.slots_without_trade_snapshot,
+        warn!(
+            event.name = "liquidity_position_inactive_slots_saturated",
+            lp.inactive_slots = raw_inactive,
+            lp.elapsed_slots = elapsed_slots,
+            bookkeeping.slots_without_trade = bookkeeping.slots_without_trade,
+            lp.slots_without_trade_snapshot = liquidity_position.slots_without_trade_snapshot,
         );
     }
-    println!(
-        "[balances] on-chain: base={} base_debt={} quote={} quote_debt={} base_flow={} quote_flow={}",
-        liquidity_position.base_balance,
-        liquidity_position.base_debt,
-        liquidity_position.quote_balance,
-        liquidity_position.quote_debt,
-        liquidity_position.base_flow_u64,
-        liquidity_position.quote_flow_u64,
+    info!(
+        event.name = "liquidity_position_on_chain_balances",
+        position.base_balance.raw = liquidity_position.base_balance,
+        position.base_debt.raw = liquidity_position.base_debt,
+        position.quote_balance.raw = liquidity_position.quote_balance,
+        position.quote_debt.raw = liquidity_position.quote_debt,
+        position.base_flow.raw = liquidity_position.base_flow_u64,
+        position.quote_flow.raw = liquidity_position.quote_flow_u64,
     );
 
     // Base token outflow since last update slot
@@ -249,12 +249,12 @@ pub async fn get_liquidity_position_balances(
     let accumulated_quote_inflow = (quote_per_base - liquidity_position.quote_per_base_snapshot)
         * liquidity_position.base_flow_u64 as u128;
 
-    println!(
-        "[balances] flows (scaled): base_outflow={} base_inflow={} quote_outflow={} quote_inflow={}",
-        accumulated_base_outflow / BOOKKEEPING_PRECISION_FACTOR,
-        accumulated_base_inflow / BOOKKEEPING_PRECISION_FACTOR,
-        accumulated_quote_outflow / BOOKKEEPING_PRECISION_FACTOR,
-        accumulated_quote_inflow / BOOKKEEPING_PRECISION_FACTOR,
+    info!(
+        event.name = "liquidity_position_computed_flows",
+        position.base_outflow.raw = accumulated_base_outflow / BOOKKEEPING_PRECISION_FACTOR,
+        position.base_inflow.raw = accumulated_base_inflow / BOOKKEEPING_PRECISION_FACTOR,
+        position.quote_outflow.raw = accumulated_quote_outflow / BOOKKEEPING_PRECISION_FACTOR,
+        position.quote_inflow.raw = accumulated_quote_inflow / BOOKKEEPING_PRECISION_FACTOR,
     );
 
     let base_balance;
@@ -286,9 +286,12 @@ pub async fn get_liquidity_position_balances(
         quote_debt = 0;
     }
 
-    println!(
-        "[balances] computed: base={} base_debt={} quote={} quote_debt={}",
-        base_balance, base_debt, quote_balance, quote_debt,
+    info!(
+        event.name = "liquidity_position_computed_balances",
+        position.base_balance.raw = base_balance,
+        position.base_debt.raw = base_debt,
+        position.quote_balance.raw = quote_balance,
+        position.quote_debt.raw = quote_debt,
     );
 
     LiquidityPositionBalances {

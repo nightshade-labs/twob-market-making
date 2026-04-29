@@ -13,6 +13,7 @@ use anchor_spl::{
 };
 use anyhow::{Context, ensure};
 use tokio::time::sleep;
+use tracing::{Instrument, info, info_span, warn};
 use twob_market_making::{
     ARRAY_LENGTH, AccountResolver, LIQUIDITY_AMPLIFICATION, LiquidityPositionBalances, MarketState,
     build_withdraw_liquidity_instruction, execute_add_liquidity, execute_withdraw_liquidity,
@@ -23,6 +24,7 @@ use crate::{
     config::JupiterConfig,
     jupiter::{JupiterUltraClient, SwapDirection},
     price::PriceData,
+    telemetry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,17 +73,21 @@ pub fn needs_rebalance(
     threshold_bps: u64,
 ) -> bool {
     if price.price <= 0.0 {
-        eprintln!(
-            "Oracle price is non-positive ({}), skipping rebalance",
-            price.price
+        warn!(
+            event.name = "rebalance_evaluate_skipped",
+            rebalance.reason = "non_positive_oracle_price",
+            price.oracle = price.price,
         );
         return false;
     }
 
     if balances.base_balance == 0 || balances.quote_balance == 0 {
-        println!(
-            "[rebalance] one side is zero (base={} quote={}) — rebalance needed",
-            balances.base_balance, balances.quote_balance,
+        info!(
+            event.name = "rebalance_evaluate",
+            rebalance.reason = "zero_inventory_side",
+            rebalance.outcome = "needed",
+            position.base_balance.raw = balances.base_balance,
+            position.quote_balance.raw = balances.quote_balance,
         );
         return true;
     }
@@ -96,13 +102,13 @@ pub fn needs_rebalance(
     let inventory_price = quote_ui / base_ui;
     let deviation_bps = ((inventory_price - price.price).abs() / price.price) * 10_000.0;
 
-    println!(
-        "[rebalance] inventory_price={:.6} oracle_price={:.6} deviation={:.2} bps threshold={} bps — {}",
-        inventory_price,
-        price.price,
-        deviation_bps,
-        threshold_bps,
-        if deviation_bps > threshold_bps as f64 {
+    info!(
+        event.name = "rebalance_evaluate",
+        price.inventory = inventory_price,
+        price.oracle = price.price,
+        inventory_deviation_bps = deviation_bps,
+        rebalance.threshold_bps = threshold_bps,
+        rebalance.outcome = if deviation_bps > threshold_bps as f64 {
             "needed"
         } else {
             "ok"
@@ -130,16 +136,46 @@ pub async fn execute_rebalance(
     _max_reduction_attempts: usize,
     min_rebalance_value_usd: f64,
     is_devnet: bool,
+    cycle_id: &str,
+    attempt_id: &str,
 ) -> anyhow::Result<RebalanceOutcome> {
+    let mut previous_wallet_snapshot = None;
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "rebalance_pre_plan",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
+    )
+    .await;
+
     if is_devnet {
-        println!("Devnet detected. Skipping execute_rebalance (no-op).");
+        info!(
+            event.name = "rebalance_skipped",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.reason = "devnet_noop",
+            rebalance.outcome = "skipped",
+        );
         return Ok(RebalanceOutcome::Skipped);
     }
 
     if balances.base_debt > 0 || balances.quote_debt > 0 {
-        println!(
-            "Skipping rebalance because the liquidity position is unhealthy: base_debt={} quote_debt={}",
-            balances.base_debt, balances.quote_debt
+        warn!(
+            event.name = "rebalance_skipped",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.reason = "liquidity_position_unhealthy",
+            rebalance.outcome = "skipped",
+            position.base_debt.raw = balances.base_debt,
+            position.quote_debt.raw = balances.quote_debt,
         );
         return Ok(RebalanceOutcome::Skipped);
     }
@@ -151,16 +187,27 @@ pub async fn execute_rebalance(
         quote_token_decimals,
         min_rebalance_value_usd,
     ) else {
-        println!(
-            "[rebalance] skipping — computed withdraw amount rounds to zero or is below minimum"
+        info!(
+            event.name = "rebalance_skipped",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.reason = "planned_input_below_minimum",
+            rebalance.outcome = "skipped",
         );
         return Ok(RebalanceOutcome::Skipped);
     };
-    println!(
-        "[rebalance] planned {} withdraw: base={} quote={}",
-        uncapped_plan.direction.label(),
-        uncapped_plan.withdraw_base_lamports,
-        uncapped_plan.withdraw_quote_lamports,
+    info!(
+        event.name = "rebalance_planned",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        rebalance.direction = uncapped_plan.direction.label(),
+        rebalance.planned_base_withdraw.raw = uncapped_plan.withdraw_base_lamports,
+        rebalance.planned_quote_withdraw.raw = uncapped_plan.withdraw_quote_lamports,
+        rebalance.planned_input.raw = uncapped_plan.input_amount(),
     );
     let Some(plan) = cap_rebalance_to_withdrawable(
         uncapped_plan,
@@ -168,18 +215,31 @@ pub async fn execute_rebalance(
         current_base_flow,
         current_quote_flow,
     ) else {
-        println!(
-            "[rebalance] skipping — no withdrawable liquidity after capping to available balance \
-             (base_balance={} quote_balance={} base_flow={} quote_flow={})",
-            balances.base_balance, balances.quote_balance, current_base_flow, current_quote_flow,
+        info!(
+            event.name = "rebalance_skipped",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.reason = "no_withdrawable_liquidity",
+            rebalance.outcome = "skipped",
+            position.base_balance.raw = balances.base_balance,
+            position.quote_balance.raw = balances.quote_balance,
+            position.base_flow.raw = current_base_flow,
+            position.quote_flow.raw = current_quote_flow,
         );
         return Ok(RebalanceOutcome::Skipped);
     };
-    println!(
-        "[rebalance] capped {} withdraw: base={} quote={}",
-        plan.direction.label(),
-        plan.withdraw_base_lamports,
-        plan.withdraw_quote_lamports,
+    info!(
+        event.name = "rebalance_capped",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        rebalance.direction = plan.direction.label(),
+        rebalance.planned_input.raw = plan.input_amount(),
+        rebalance.planned_base_withdraw.raw = plan.withdraw_base_lamports,
+        rebalance.planned_quote_withdraw.raw = plan.withdraw_quote_lamports,
     );
     let (input_mint, output_mint) = match plan.direction {
         SwapDirection::BaseToQuote => (
@@ -209,13 +269,18 @@ pub async fn execute_rebalance(
     let withdraw_amount = target_swap_amount.saturating_sub(existing_input_balance);
     let withdraw_plan = plan.with_input_amount(withdraw_amount);
 
-    println!(
-        "Executing rebalance {}: target_swap={} wallet_input={} withdraw_base={} withdraw_quote={}",
-        plan.direction.label(),
-        target_swap_amount,
-        existing_input_balance,
-        withdraw_plan.withdraw_base_lamports,
-        withdraw_plan.withdraw_quote_lamports
+    info!(
+        event.name = "rebalance_execution_planned",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        rebalance.direction = plan.direction.label(),
+        rebalance.planned_input.raw = target_swap_amount,
+        rebalance.wallet_input_before.raw = existing_input_balance,
+        rebalance.withdrawn_input.raw = withdraw_amount,
+        rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
+        rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
     );
     log_rebalance_transfer_accounts(
         program,
@@ -223,6 +288,18 @@ pub async fn execute_rebalance(
         market_state,
         liquidity_provider.pubkey(),
         withdraw_plan,
+    )
+    .await;
+
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "pre_withdraw",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
     )
     .await;
 
@@ -236,11 +313,44 @@ pub async fn execute_rebalance(
             liquidity_provider.clone(),
             withdraw_plan,
         )
+        .instrument(info_span!(
+            "twob.withdraw_liquidity",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            twob.instruction = "withdraw_liquidity",
+            twob.reference_index = withdraw_reference_index,
+            rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
+            rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
+        ))
         .await
         .context("Failed to withdraw liquidity for rebalance")?;
     } else {
-        println!("[rebalance] using wallet input balance; no additional withdraw needed");
+        warn!(
+            event.name = "rebalance_using_existing_wallet_input",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.direction = plan.direction.label(),
+            rebalance.wallet_input_before.raw = existing_input_balance,
+            rebalance.planned_input.raw = target_swap_amount,
+            "using existing wallet input balance; no additional withdraw needed"
+        );
     }
+
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "post_withdraw",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
+    )
+    .await;
 
     let expected_input_balance = existing_input_balance.saturating_add(withdraw_amount);
     let actual_input_balance = wait_for_swap_input_balance(
@@ -253,16 +363,30 @@ pub async fn execute_rebalance(
     .await?;
     let swap_amount = actual_input_balance.min(target_swap_amount);
 
-    println!(
-        "[jupiter] input balance after withdrawal: target={} actual={} using={}",
-        target_swap_amount, actual_input_balance, swap_amount,
+    info!(
+        event.name = "rebalance_input_balance_ready",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        rebalance.planned_input.raw = target_swap_amount,
+        rebalance.actual_input_balance.raw = actual_input_balance,
+        rebalance.swap_input_requested.raw = swap_amount,
     );
 
     if swap_amount == 0 {
         if withdraw_amount > 0 {
             anyhow::bail!("withdraw succeeded but no Jupiter input balance is visible");
         }
-        println!("[rebalance] no Jupiter input balance available — skipping swap");
+        info!(
+            event.name = "rebalance_skipped",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.reason = "no_jupiter_input_balance",
+            rebalance.outcome = "skipped",
+        );
         return Ok(RebalanceOutcome::Skipped);
     }
 
@@ -279,6 +403,18 @@ pub async fn execute_rebalance(
     )
     .await?;
 
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "pre_jupiter_order",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
+    )
+    .await;
+
     let swap_execution = JupiterUltraClient::new(http_client, jupiter_config)
         .swap_exact_in(
             liquidity_provider.clone(),
@@ -286,6 +422,17 @@ pub async fn execute_rebalance(
             output_mint,
             swap_amount,
         )
+        .instrument(info_span!(
+            "jupiter.execute",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.direction = plan.direction.label(),
+            jupiter.input_mint = %input_mint,
+            jupiter.output_mint = %output_mint,
+            rebalance.swap_input_requested.raw = swap_amount,
+        ))
         .await
         .with_context(|| {
             format!(
@@ -293,6 +440,63 @@ pub async fn execute_rebalance(
                 plan.direction.label()
             )
         })?;
+
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "post_jupiter_execute",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
+    )
+    .await;
+
+    let prior_pending_input = 0_u64;
+    let available_budget = withdraw_amount.saturating_add(prior_pending_input);
+    let external_wallet_input_estimated =
+        telemetry::external_wallet_input_estimated(swap_execution.input_consumed, available_budget);
+    info!(
+        event.name = "jupiter_swap_completed",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        rebalance.direction = plan.direction.label(),
+        rebalance.available_budget.raw = available_budget,
+        rebalance.withdrawn_input.raw = withdraw_amount,
+        rebalance.prior_pending_input.raw = prior_pending_input,
+        rebalance.wallet_input_before.raw = existing_input_balance,
+        rebalance.swap_input_requested.raw = swap_amount,
+        jupiter.input_consumed.raw = swap_execution.input_consumed,
+        jupiter.output_received.raw = swap_execution.output_received,
+        jupiter.external_wallet_input_estimated.raw = external_wallet_input_estimated,
+        jupiter.request_id = ?swap_execution.request_id,
+        jupiter.router = ?swap_execution.router,
+        jupiter.slippage_bps = ?swap_execution.slippage_bps,
+        jupiter.price_impact_bps = ?swap_execution.price_impact_bps,
+        jupiter.signature = ?swap_execution.signature,
+        monotonic_counter.jupiter_executes_total = 1_u64,
+    );
+    if external_wallet_input_estimated > dust_threshold_for_mint(&input_mint) {
+        warn!(
+            event.name = "wallet_external_spend_suspected",
+            cycle.id = %cycle_id,
+            market.id = market_id,
+            lp.authority = %liquidity_provider.pubkey(),
+            rebalance.attempt_id = %attempt_id,
+            rebalance.direction = plan.direction.label(),
+            rebalance.available_budget.raw = available_budget,
+            rebalance.withdrawn_input.raw = withdraw_amount,
+            rebalance.wallet_input_before.raw = existing_input_balance,
+            rebalance.swap_input_requested.raw = swap_amount,
+            jupiter.input_consumed.raw = swap_execution.input_consumed,
+            jupiter.external_wallet_input_estimated.raw = external_wallet_input_estimated,
+            monotonic_counter.wallet_external_spend_suspected_total = 1_u64,
+            "Jupiter consumed more input than the amount withdrawn by this rebalance"
+        );
+    }
 
     let (mut deposit_base_lamports, mut deposit_quote_lamports) = match plan.direction {
         SwapDirection::BaseToQuote => (
@@ -332,6 +536,18 @@ pub async fn execute_rebalance(
         "No settled Jupiter output is available to add back after rebalance"
     );
 
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "pre_add_liquidity",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
+    )
+    .await;
+
     let add_reference_index =
         oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
     execute_add_liquidity(
@@ -340,18 +556,49 @@ pub async fn execute_rebalance(
         deposit_base_lamports,
         deposit_quote_lamports,
         add_reference_index,
-        liquidity_provider,
+        liquidity_provider.clone(),
     )
+    .instrument(info_span!(
+        "twob.add_liquidity",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        rebalance.attempt_id = %attempt_id,
+        twob.instruction = "add_liquidity",
+        twob.reference_index = add_reference_index,
+        rebalance.deposit_base.raw = deposit_base_lamports,
+        rebalance.deposit_quote.raw = deposit_quote_lamports,
+    ))
     .await
     .context("Failed to add rebalanced liquidity back to the position")?;
 
-    println!(
-        "Rebalance swap completed: signature={:?} input_consumed={} output_received={} deposit_base={} deposit_quote={}",
-        swap_execution.signature,
-        swap_execution.input_consumed,
-        swap_execution.output_received,
-        deposit_base_lamports,
-        deposit_quote_lamports
+    log_wallet_balance_snapshot(
+        program,
+        market_state,
+        &liquidity_provider.pubkey(),
+        balances,
+        "post_add_liquidity",
+        cycle_id,
+        attempt_id,
+        &mut previous_wallet_snapshot,
+    )
+    .await;
+
+    info!(
+        event.name = "rebalance_swap_completed",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        rebalance.attempt_id = %attempt_id,
+        rebalance.direction = plan.direction.label(),
+        rebalance.outcome = "executed",
+        jupiter.request_id = ?swap_execution.request_id,
+        jupiter.router = ?swap_execution.router,
+        jupiter.slippage_bps = ?swap_execution.slippage_bps,
+        jupiter.price_impact_bps = ?swap_execution.price_impact_bps,
+        jupiter.signature = ?swap_execution.signature,
+        jupiter.input_consumed.raw = swap_execution.input_consumed,
+        jupiter.output_received.raw = swap_execution.output_received,
+        rebalance.deposit_base.raw = deposit_base_lamports,
+        rebalance.deposit_quote.raw = deposit_quote_lamports,
     );
 
     Ok(RebalanceOutcome::Executed)
@@ -419,9 +666,13 @@ async fn log_rebalance_transfer_accounts(
         match get_token_program_id(program, &market_state.market.base_mint).await {
             Ok(program_id) => program_id,
             Err(error) => {
-                eprintln!(
-                    "Withdraw debug: failed to fetch base token program: {:#}",
-                    error
+                warn!(
+                    event.name = "rebalance_transfer_account_debug_failed",
+                    market.id = market_id,
+                    lp.authority = %authority,
+                    base.mint = %market_state.market.base_mint,
+                    ?error,
+                    "failed to fetch base token program"
                 );
                 return;
             }
@@ -430,9 +681,13 @@ async fn log_rebalance_transfer_accounts(
         match get_token_program_id(program, &market_state.market.quote_mint).await {
             Ok(program_id) => program_id,
             Err(error) => {
-                eprintln!(
-                    "Withdraw debug: failed to fetch quote token program: {:#}",
-                    error
+                warn!(
+                    event.name = "rebalance_transfer_account_debug_failed",
+                    market.id = market_id,
+                    lp.authority = %authority,
+                    quote.mint = %market_state.market.quote_mint,
+                    ?error,
+                    "failed to fetch quote token program"
                 );
                 return;
             }
@@ -459,12 +714,14 @@ async fn log_rebalance_transfer_accounts(
         &quote_token_program,
     );
 
-    println!(
-        "Withdraw debug: market_pda={} direction={} base_token_program={} quote_token_program={}",
-        market_pda,
-        plan.direction.label(),
-        base_token_program,
-        quote_token_program
+    info!(
+        event.name = "rebalance_transfer_accounts",
+        market.id = market_id,
+        lp.authority = %authority,
+        market.pda = %market_pda,
+        rebalance.direction = plan.direction.label(),
+        base.token_program = %base_token_program,
+        quote.token_program = %quote_token_program,
     );
 
     match plan.direction {
@@ -497,9 +754,12 @@ async fn log_token_account_state(
     let account = match program.rpc().get_account(&token_account).await {
         Ok(account) => account,
         Err(error) => {
-            eprintln!(
-                "Withdraw debug {}: failed to fetch account {}: {}",
-                label, token_account, error
+            warn!(
+                event.name = "token_account_debug_failed",
+                token_account.label = label,
+                token_account.address = %token_account,
+                ?error,
+                "failed to fetch token account"
             );
             return;
         }
@@ -508,24 +768,27 @@ async fn log_token_account_state(
     let token_state = match SplTokenAccount::unpack(&account.data) {
         Ok(state) => state,
         Err(error) => {
-            eprintln!(
-                "Withdraw debug {}: failed to decode token account {}: {}",
-                label, token_account, error
+            warn!(
+                event.name = "token_account_debug_failed",
+                token_account.label = label,
+                token_account.address = %token_account,
+                ?error,
+                "failed to decode token account"
             );
             return;
         }
     };
 
-    println!(
-        "Withdraw debug {}: pubkey={} owner_program={} token_owner={} mint={} amount={} lamports={} is_native={}",
-        label,
-        token_account,
-        account.owner,
-        token_state.owner,
-        token_state.mint,
-        token_state.amount,
-        account.lamports,
-        token_state.is_native()
+    info!(
+        event.name = "token_account_debug",
+        token_account.label = label,
+        token_account.address = %token_account,
+        token_account.owner_program = %account.owner,
+        token_account.owner = %token_state.owner,
+        token_account.mint = %token_state.mint,
+        token_account.amount.raw = token_state.amount,
+        token_account.lamports = account.lamports,
+        token_account.is_native = token_state.is_native(),
     );
 }
 
@@ -559,10 +822,11 @@ fn plan_rebalance(
     // One side fully depleted: swap half of the available side to restore the missing one.
     if balances.base_balance == 0 && balances.quote_balance > 0 {
         let withdraw_quote_lamports = balances.quote_balance / 2;
-        println!(
-            "[rebalance] plan: base depleted — swapping half of quote to base \
-             (withdraw_quote={})",
-            withdraw_quote_lamports,
+        info!(
+            event.name = "rebalance_plan_selected",
+            rebalance.reason = "base_depleted",
+            rebalance.direction = SwapDirection::QuoteToBase.label(),
+            rebalance.planned_quote_withdraw.raw = withdraw_quote_lamports,
         );
         return Some(RebalancePlan {
             direction: SwapDirection::QuoteToBase,
@@ -572,10 +836,11 @@ fn plan_rebalance(
     }
     if balances.quote_balance == 0 && balances.base_balance > 0 {
         let withdraw_base_lamports = balances.base_balance / 2;
-        println!(
-            "[rebalance] plan: quote depleted — swapping half of base to quote \
-             (withdraw_base={})",
-            withdraw_base_lamports,
+        info!(
+            event.name = "rebalance_plan_selected",
+            rebalance.reason = "quote_depleted",
+            rebalance.direction = SwapDirection::BaseToQuote.label(),
+            rebalance.planned_base_withdraw.raw = withdraw_base_lamports,
         );
         return Some(RebalancePlan {
             direction: SwapDirection::BaseToQuote,
@@ -585,22 +850,23 @@ fn plan_rebalance(
     }
 
     if !base_ui.is_finite() || !quote_ui.is_finite() || base_ui <= 0.0 || quote_ui <= 0.0 {
-        println!(
-            "[rebalance] plan: cannot plan — invalid UI amounts (base={} quote={})",
-            base_ui, quote_ui,
+        warn!(
+            event.name = "rebalance_plan_rejected",
+            rebalance.reason = "invalid_ui_amounts",
+            rebalance.base_ui = base_ui,
+            rebalance.quote_ui = quote_ui,
         );
         return None;
     }
 
-    println!(
-        "[rebalance] plan: base={:.6} quote={:.6} oracle={:.6} \
-         ideal_quote={:.6} quote_excess={:.6} base_excess={:.6}",
-        base_ui,
-        quote_ui,
-        price.price,
-        base_ui * price.price,
-        (quote_ui - base_ui * price.price).max(0.0),
-        (base_ui - quote_ui / price.price).max(0.0),
+    info!(
+        event.name = "rebalance_plan_inputs",
+        rebalance.base_ui = base_ui,
+        rebalance.quote_ui = quote_ui,
+        price.oracle = price.price,
+        rebalance.ideal_quote_ui = base_ui * price.price,
+        rebalance.quote_excess_ui = (quote_ui - base_ui * price.price).max(0.0),
+        rebalance.base_excess_ui = (base_ui - quote_ui / price.price).max(0.0),
     );
 
     let quote_excess_ui = (quote_ui - base_ui * price.price).max(0.0);
@@ -608,9 +874,11 @@ fn plan_rebalance(
         let withdraw_quote_ui = quote_excess_ui / 2.0;
         let withdraw_value_usd = withdraw_quote_ui; // quote is USD-denominated
         if withdraw_value_usd < min_rebalance_value_usd {
-            println!(
-                "[rebalance] plan: quote withdraw ${:.4} is below minimum ${:.2} — no plan",
-                withdraw_value_usd, min_rebalance_value_usd,
+            info!(
+                event.name = "rebalance_plan_rejected",
+                rebalance.reason = "quote_withdraw_below_minimum",
+                rebalance.withdraw_value_usd = withdraw_value_usd,
+                rebalance.min_value_usd = min_rebalance_value_usd,
             );
             return None;
         }
@@ -623,9 +891,10 @@ fn plan_rebalance(
                 withdraw_quote_lamports,
             });
         }
-        println!(
-            "[rebalance] plan: quote excess {:.6} rounds to 0 lamports — no plan",
-            withdraw_quote_ui,
+        info!(
+            event.name = "rebalance_plan_rejected",
+            rebalance.reason = "quote_excess_rounds_to_zero",
+            rebalance.withdraw_quote_ui = withdraw_quote_ui,
         );
     }
 
@@ -633,9 +902,11 @@ fn plan_rebalance(
     let withdraw_base_ui = base_excess_ui / 2.0;
     let withdraw_value_usd = withdraw_base_ui * price.price;
     if withdraw_base_ui > 0.0 && withdraw_value_usd < min_rebalance_value_usd {
-        println!(
-            "[rebalance] plan: base withdraw ${:.4} is below minimum ${:.2} — no plan",
-            withdraw_value_usd, min_rebalance_value_usd,
+        info!(
+            event.name = "rebalance_plan_rejected",
+            rebalance.reason = "base_withdraw_below_minimum",
+            rebalance.withdraw_value_usd = withdraw_value_usd,
+            rebalance.min_value_usd = min_rebalance_value_usd,
         );
         return None;
     }
@@ -648,9 +919,10 @@ fn plan_rebalance(
         });
     }
 
-    println!(
-        "[rebalance] plan: base excess {:.6} rounds to 0 lamports — no plan",
-        withdraw_base_ui,
+    info!(
+        event.name = "rebalance_plan_rejected",
+        rebalance.reason = "base_excess_rounds_to_zero",
+        rebalance.withdraw_base_ui = withdraw_base_ui,
     );
     None
 }
@@ -689,6 +961,132 @@ const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const FEE_RESERVE_LAMPORTS: u64 = 10_000_000; // 0.01 SOL
 const BALANCE_POLL_ATTEMPTS: usize = 8;
 const BALANCE_POLL_DELAY: Duration = Duration::from_millis(750);
+const DEFAULT_TOKEN_DUST_RAW: u64 = 10;
+const NATIVE_SOL_DUST_LAMPORTS: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy)]
+struct WalletBalanceSnapshot {
+    native_sol_lamports: u64,
+    base_ata: Pubkey,
+    base_ata_raw: u64,
+    quote_ata: Pubkey,
+    quote_ata_raw: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_wallet_balance_snapshot(
+    program: &Program<Arc<Keypair>>,
+    market_state: &MarketState,
+    owner: &Pubkey,
+    balances: &LiquidityPositionBalances,
+    stage: &str,
+    cycle_id: &str,
+    attempt_id: &str,
+    previous: &mut Option<WalletBalanceSnapshot>,
+) {
+    let snapshot = match read_wallet_balance_snapshot(program, market_state, owner).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(
+                event.name = "wallet_balance_snapshot_error",
+                snapshot.stage = stage,
+                cycle.id = %cycle_id,
+                market.id = market_state.market.id,
+                lp.authority = %owner,
+                rebalance.attempt_id = %attempt_id,
+                ?error,
+                "failed to read wallet balance snapshot"
+            );
+            return;
+        }
+    };
+
+    let (native_sol_delta, base_delta, quote_delta) =
+        previous.map_or((0_i64, 0_i64, 0_i64), |previous_snapshot| {
+            (
+                clamp_delta(telemetry::balance_delta(
+                    snapshot.native_sol_lamports,
+                    previous_snapshot.native_sol_lamports,
+                )),
+                clamp_delta(telemetry::balance_delta(
+                    snapshot.base_ata_raw,
+                    previous_snapshot.base_ata_raw,
+                )),
+                clamp_delta(telemetry::balance_delta(
+                    snapshot.quote_ata_raw,
+                    previous_snapshot.quote_ata_raw,
+                )),
+            )
+        });
+
+    info!(
+        event.name = "wallet_balance_snapshot",
+        snapshot.stage = stage,
+        cycle.id = %cycle_id,
+        slot.current = market_state.current_slot,
+        market.id = market_state.market.id,
+        lp.authority = %owner,
+        rebalance.attempt_id = %attempt_id,
+        base.mint = %market_state.market.base_mint,
+        quote.mint = %market_state.market.quote_mint,
+        position.base_balance.raw = balances.base_balance,
+        position.quote_balance.raw = balances.quote_balance,
+        position.base_debt.raw = balances.base_debt,
+        position.quote_debt.raw = balances.quote_debt,
+        wallet.native_sol.lamports = snapshot.native_sol_lamports,
+        wallet.base_ata.address = %snapshot.base_ata,
+        wallet.base_ata.raw = snapshot.base_ata_raw,
+        wallet.quote_ata.address = %snapshot.quote_ata,
+        wallet.quote_ata.raw = snapshot.quote_ata_raw,
+        wallet.native_sol_delta.raw = native_sol_delta,
+        wallet.base_delta.raw = base_delta,
+        wallet.quote_delta.raw = quote_delta,
+        gauge.wallet_native_sol_lamports = snapshot.native_sol_lamports as f64,
+        gauge.wallet_base_balance_raw = snapshot.base_ata_raw as f64,
+        gauge.wallet_quote_balance_raw = snapshot.quote_ata_raw as f64,
+    );
+
+    *previous = Some(snapshot);
+}
+
+async fn read_wallet_balance_snapshot(
+    program: &Program<Arc<Keypair>>,
+    market_state: &MarketState,
+    owner: &Pubkey,
+) -> anyhow::Result<WalletBalanceSnapshot> {
+    let base_token_program = get_token_program_id(program, &market_state.market.base_mint).await?;
+    let quote_token_program =
+        get_token_program_id(program, &market_state.market.quote_mint).await?;
+    let base_ata = get_associated_token_address_with_program_id(
+        owner,
+        &market_state.market.base_mint,
+        &base_token_program,
+    );
+    let quote_ata = get_associated_token_address_with_program_id(
+        owner,
+        &market_state.market.quote_mint,
+        &quote_token_program,
+    );
+    let native_sol_lamports = program
+        .rpc()
+        .get_balance(owner)
+        .await
+        .context("Failed to read LP native SOL balance")?;
+    let base_ata_raw = read_ata_balance_or_zero(program, &base_ata).await?;
+    let quote_ata_raw = read_ata_balance_or_zero(program, &quote_ata).await?;
+
+    Ok(WalletBalanceSnapshot {
+        native_sol_lamports,
+        base_ata,
+        base_ata_raw,
+        quote_ata,
+        quote_ata_raw,
+    })
+}
+
+fn clamp_delta(delta: i128) -> i64 {
+    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
 
 async fn prepare_wsol_input_for_jupiter(
     program: &Program<Arc<Keypair>>,
@@ -705,9 +1103,11 @@ async fn prepare_wsol_input_for_jupiter(
     let wsol_balance = read_ata_balance_or_zero(program, wsol_ata).await?;
 
     if wsol_balance > 0 {
-        println!(
-            "[jupiter] unwrapping {} wSOL lamports from {} before swap",
-            wsol_balance, wsol_ata,
+        info!(
+            event.name = "jupiter_wsol_input_unwrap",
+            wallet.wsol_ata.address = %wsol_ata,
+            wallet.wsol_ata.raw = wsol_balance,
+            rebalance.swap_input_requested.raw = swap_amount,
         );
         let close_ix = anchor_spl::token::spl_token::instruction::close_account(
             &anchor_spl::token::spl_token::ID,
@@ -734,9 +1134,11 @@ async fn prepare_wsol_input_for_jupiter(
         .await
         .context("Failed to confirm native SOL balance before Jupiter swap")?;
 
-    println!(
-        "[jupiter] native SOL wallet: {} lamports (swap needs {} + {} fee reserve)",
-        native_balance, swap_amount, FEE_RESERVE_LAMPORTS,
+    info!(
+        event.name = "jupiter_native_sol_input_ready",
+        wallet.native_sol.lamports = native_balance,
+        rebalance.swap_input_requested.raw = swap_amount,
+        wallet.native_sol_fee_reserve.lamports = FEE_RESERVE_LAMPORTS,
     );
 
     ensure!(
@@ -873,9 +1275,11 @@ async fn prepare_deposit_balance(
 
     let available = wait_for_ata_balance_at_least(program, &ata, requested_amount).await?;
     if available < requested_amount {
-        eprintln!(
-            "[rebalance] capping deposit for mint {}: requested={} available={}",
-            mint, requested_amount, available,
+        warn!(
+            event.name = "rebalance_deposit_capped",
+            token.mint = %mint,
+            rebalance.deposit_requested.raw = requested_amount,
+            rebalance.deposit_available.raw = available,
         );
     }
     Ok(available.min(requested_amount))
@@ -903,9 +1307,11 @@ async fn prepare_wsol_deposit_balance(
         .min(deficit);
 
     if wrap_amount == 0 {
-        eprintln!(
-            "[rebalance] capping wSOL deposit: requested={} available={}",
-            requested_amount, current_wsol,
+        warn!(
+            event.name = "rebalance_wsol_deposit_capped",
+            rebalance.deposit_requested.raw = requested_amount,
+            rebalance.deposit_available.raw = current_wsol,
+            wallet.native_sol.lamports = native_balance,
         );
         return Ok(current_wsol.min(requested_amount));
     }
@@ -938,9 +1344,11 @@ async fn prepare_wsol_deposit_balance(
     let expected_wsol = current_wsol.saturating_add(wrap_amount);
     let final_wsol = wait_for_ata_balance_at_least(program, wsol_ata, expected_wsol).await?;
     if final_wsol < requested_amount {
-        eprintln!(
-            "[rebalance] capping wSOL deposit after wrap: requested={} available={}",
-            requested_amount, final_wsol,
+        warn!(
+            event.name = "rebalance_wsol_deposit_capped_after_wrap",
+            wallet.wsol_ata.address = %wsol_ata,
+            rebalance.deposit_requested.raw = requested_amount,
+            rebalance.deposit_available.raw = final_wsol,
         );
     }
     Ok(final_wsol.min(requested_amount))
@@ -952,6 +1360,14 @@ fn native_sol_mint() -> Pubkey {
 
 fn is_native_sol_mint(mint: &Pubkey) -> bool {
     *mint == native_sol_mint()
+}
+
+fn dust_threshold_for_mint(mint: &Pubkey) -> u64 {
+    if is_native_sol_mint(mint) {
+        NATIVE_SOL_DUST_LAMPORTS
+    } else {
+        DEFAULT_TOKEN_DUST_RAW
+    }
 }
 
 fn ui_amount_to_lamports(amount_ui: f64, decimals: u8) -> u64 {

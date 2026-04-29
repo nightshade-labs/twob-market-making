@@ -2,6 +2,7 @@ use anyhow::{Context, anyhow};
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct PriceData {
@@ -18,13 +19,15 @@ struct PriceResponse {
 }
 
 pub async fn fetch_price(client: &reqwest::Client, url: &str) -> anyhow::Result<PriceData> {
-    println!("Fetching price feed from {}", url);
+    info!(event.name = "price_fetch_requested", price.feed_url = %url);
     let response: PriceResponse = client.get(url).send().await?.json().await?;
 
     let price = parse_price(&response.price)?;
     let timestamp = parse_timestamp(response.timestamp.as_ref()).unwrap_or_else(|err| {
-        eprintln!(
-            "Failed to parse price-feed timestamp ({err}). Falling back to current UNIX time."
+        warn!(
+            event.name = "price_timestamp_parse_failed",
+            error = %err,
+            "falling back to current UNIX time"
         );
         unix_now()
     });

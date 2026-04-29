@@ -2,6 +2,8 @@ use std::env;
 
 use anchor_client::{Cluster, solana_sdk::signature::Keypair};
 
+use crate::telemetry::TelemetryConfig;
+
 #[derive(Clone, Debug)]
 pub struct JupiterConfig {
     pub api_key: Option<String>,
@@ -28,6 +30,7 @@ pub struct Config {
     pub rebalance_cooldown_secs: u64,
     pub min_rebalance_value_usd: f64,
     pub jupiter: JupiterConfig,
+    pub telemetry: TelemetryConfig,
 }
 
 impl Config {
@@ -101,6 +104,8 @@ impl Config {
             .unwrap_or_else(|_| "1.0".to_string())
             .parse::<f64>()?;
 
+        let telemetry = TelemetryConfig::from_env()?;
+
         let jupiter = JupiterConfig {
             api_key: env::var("JUPITER_API_KEY")
                 .ok()
@@ -135,6 +140,7 @@ impl Config {
             rebalance_cooldown_secs,
             min_rebalance_value_usd,
             jupiter,
+            telemetry,
         })
     }
 

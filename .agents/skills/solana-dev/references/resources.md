@@ -1,3 +1,8 @@
+---
+title: Curated Resources
+description: Authoritative Solana learning platforms, documentation, tooling references, and community resources.
+---
+
 # Curated Resources (Source-of-Truth First)
 
 ## Learning Platforms
@@ -48,7 +53,7 @@
 - [mollusk-svm crate](https://crates.io/crates/mollusk-svm)
 
 ### Surfpool
-- [Surfpool Documentation](https://docs.surfpool.dev/)
+- [Surfpool Documentation](https://docs.surfpool.run/)
 - [Surfpool Repository](https://github.com/txtx/surfpool)
 
 ## IDLs and Codegen

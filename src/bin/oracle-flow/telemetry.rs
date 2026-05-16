@@ -238,10 +238,6 @@ pub fn balance_delta(after: u64, before: u64) -> i128 {
     i128::from(after) - i128::from(before)
 }
 
-pub fn external_wallet_input_estimated(input_consumed: u64, available_budget: u64) -> u64 {
-    input_consumed.saturating_sub(available_budget)
-}
-
 pub fn token_amount_ui(raw_amount: u64, decimals: u8) -> f64 {
     let scale = 10_u64.checked_pow(u32::from(decimals)).unwrap_or(1) as f64;
     raw_amount as f64 / scale
@@ -423,12 +419,6 @@ mod tests {
     fn computes_balance_delta() {
         assert_eq!(balance_delta(110, 100), 10);
         assert_eq!(balance_delta(90, 100), -10);
-    }
-
-    #[test]
-    fn estimates_external_wallet_input() {
-        assert_eq!(external_wallet_input_estimated(150, 100), 50);
-        assert_eq!(external_wallet_input_estimated(80, 100), 0);
     }
 
     #[test]

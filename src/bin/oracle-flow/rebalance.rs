@@ -1,28 +1,41 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anchor_client::{
     Program,
     solana_sdk::{
-        commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
+        commitment_config::CommitmentConfig,
+        compute_budget::ComputeBudgetInstruction,
+        instruction::Instruction,
+        message::{VersionedMessage, v0::Message as MessageV0},
+        pubkey::Pubkey,
+        signature::{Keypair, Signature},
+        signer::Signer,
+        transaction::VersionedTransaction,
     },
 };
-use anchor_lang::solana_program::{program_pack::Pack, system_instruction};
+use anchor_lang::solana_program::program_pack::Pack;
 use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
     token::spl_token::state::Account as SplTokenAccount,
 };
 use anyhow::{Context, ensure};
+use solana_rpc_client_types::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use tokio::time::sleep;
 use tracing::{Instrument, info, info_span, warn};
 use twob_market_making::{
     ARRAY_LENGTH, AccountResolver, LIQUIDITY_AMPLIFICATION, LiquidityPositionBalances, MarketState,
-    build_withdraw_liquidity_instruction, execute_add_liquidity, execute_withdraw_liquidity,
-    get_token_program_id,
+    build_add_liquidity_instruction, build_withdraw_liquidity_instruction, get_token_program_id,
 };
 
 use crate::{
     config::JupiterConfig,
-    jupiter::{JupiterUltraClient, SwapDirection},
+    jupiter::{
+        BuiltSwap, JupiterSwapClient, SwapDirection, has_compute_unit_price,
+        without_compute_unit_limit,
+    },
     price::PriceData,
     telemetry,
 };
@@ -238,36 +251,37 @@ pub async fn execute_rebalance(
     };
 
     let input_token_program = get_token_program_id(program, &input_mint).await?;
+    let output_token_program = get_token_program_id(program, &output_mint).await?;
     let lp_input_ata = get_associated_token_address_with_program_id(
         &liquidity_provider.pubkey(),
         &input_mint,
         &input_token_program,
     );
-    let target_swap_amount = plan.input_amount();
-    let existing_input_balance = read_swap_input_balance(
-        program,
-        &input_mint,
-        &lp_input_ata,
+    let lp_output_ata = get_associated_token_address_with_program_id(
         &liquidity_provider.pubkey(),
-    )
-    .await?;
+        &output_mint,
+        &output_token_program,
+    );
+    let target_swap_amount = plan.input_amount();
     let input_ata_balance_before = read_ata_balance_or_zero(program, &lp_input_ata).await?;
+    let output_ata_balance_before = read_ata_balance_or_zero(program, &lp_output_ata).await?;
     let withdraw_amount = target_swap_amount;
     let withdraw_plan = plan;
 
     info!(
-        event.name = "rebalance_execution_planned",
+        event.name = "rebalance_atomic_execution_planned",
         cycle.id = %cycle_id,
         market.id = market_id,
         lp.authority = %liquidity_provider.pubkey(),
         rebalance.attempt_id = %attempt_id,
         rebalance.direction = plan.direction.label(),
         rebalance.planned_input.raw = target_swap_amount,
-        rebalance.wallet_input_before.raw = existing_input_balance,
         rebalance.input_ata_before.raw = input_ata_balance_before,
+        rebalance.output_ata_before.raw = output_ata_balance_before,
         rebalance.withdrawn_input.raw = withdraw_amount,
         rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
         rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
+        rebalance.atomic = true,
     );
     log_rebalance_transfer_accounts(
         program,
@@ -283,14 +297,14 @@ pub async fn execute_rebalance(
         market_state,
         &liquidity_provider.pubkey(),
         balances,
-        "pre_withdraw",
+        "pre_atomic_rebalance",
         cycle_id,
         attempt_id,
         &mut previous_wallet_snapshot,
     )
     .await;
 
-    if existing_input_balance > dust_threshold_for_mint(&input_mint) {
+    if input_ata_balance_before > dust_threshold_for_mint(&input_mint) {
         warn!(
             event.name = "rebalance_ignoring_existing_wallet_input",
             cycle.id = %cycle_id,
@@ -298,124 +312,36 @@ pub async fn execute_rebalance(
             lp.authority = %liquidity_provider.pubkey(),
             rebalance.attempt_id = %attempt_id,
             rebalance.direction = plan.direction.label(),
-            rebalance.wallet_input_before.raw = existing_input_balance,
             rebalance.input_ata_before.raw = input_ata_balance_before,
             rebalance.planned_input.raw = target_swap_amount,
-            "existing wallet input is ignored; rebalance will only swap freshly withdrawn liquidity"
+            "existing input ATA balance is ignored; atomic rebalance swaps the exact withdrawn amount"
         );
     }
 
-    let withdraw_reference_index =
+    let reference_index =
         oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
-    execute_exact_withdraw_liquidity(
+    let withdraw_ix = build_withdraw_liquidity_instruction(
         program,
         market_id,
-        withdraw_reference_index,
-        liquidity_provider.clone(),
-        withdraw_plan,
+        crate::twob_anchor::client::args::WithdrawLiquidity {
+            reference_index,
+            base_lamports: withdraw_plan.withdraw_base_lamports,
+            quote_lamports: withdraw_plan.withdraw_quote_lamports,
+        },
     )
-    .instrument(info_span!(
-        "twob.withdraw_liquidity",
-        cycle.id = %cycle_id,
-        market.id = market_id,
-        lp.authority = %liquidity_provider.pubkey(),
-        rebalance.attempt_id = %attempt_id,
-        twob.instruction = "withdraw_liquidity",
-        twob.reference_index = withdraw_reference_index,
-        rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
-        rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
-    ))
     .await
-    .context("Failed to withdraw liquidity for rebalance")?;
+    .context("Failed to build withdraw_liquidity instruction for atomic rebalance")?;
 
-    log_wallet_balance_snapshot(
-        program,
-        market_state,
-        &liquidity_provider.pubkey(),
-        balances,
-        "post_withdraw",
-        cycle_id,
-        attempt_id,
-        &mut previous_wallet_snapshot,
-    )
-    .await;
-
-    let expected_input_ata_balance = input_ata_balance_before
-        .checked_add(withdraw_amount)
-        .context("input ATA balance expectation overflowed")?;
-    let input_ata_balance_after =
-        wait_for_ata_balance_at_least(program, &lp_input_ata, expected_input_ata_balance).await?;
-    ensure!(
-        input_ata_balance_after >= expected_input_ata_balance,
-        "Withdrawn input did not settle in ATA: before={} expected_after={} actual_after={}",
-        input_ata_balance_before,
-        expected_input_ata_balance,
-        input_ata_balance_after
-    );
-    let swap_amount = withdraw_amount;
-
-    info!(
-        event.name = "rebalance_input_balance_ready",
-        cycle.id = %cycle_id,
-        market.id = market_id,
-        lp.authority = %liquidity_provider.pubkey(),
-        rebalance.attempt_id = %attempt_id,
-        rebalance.planned_input.raw = target_swap_amount,
-        rebalance.input_ata_before.raw = input_ata_balance_before,
-        rebalance.input_ata_after.raw = input_ata_balance_after,
-        rebalance.swap_input_requested.raw = swap_amount,
-    );
-
-    if swap_amount == 0 {
-        if withdraw_amount > 0 {
-            anyhow::bail!("withdraw succeeded but no Jupiter input balance is visible");
-        }
-        info!(
-            event.name = "rebalance_skipped",
-            cycle.id = %cycle_id,
-            market.id = market_id,
-            lp.authority = %liquidity_provider.pubkey(),
-            rebalance.attempt_id = %attempt_id,
-            rebalance.reason = "no_jupiter_input_balance",
-            rebalance.outcome = "skipped",
-        );
-        return Ok(RebalanceOutcome::Skipped);
-    }
-
-    // Jupiter Ultra validates the LP's *native SOL wallet balance* for wSOL swaps,
-    // not the SPL token ATA balance. Always unwrap wSOL input before ordering, otherwise
-    // Jupiter can spend fee-wallet SOL while the withdrawn wSOL stays stranded outside
-    // the liquidity position.
-    prepare_wsol_input_for_jupiter(
-        program,
-        &input_mint,
-        &lp_input_ata,
-        swap_amount,
-        liquidity_provider.clone(),
-    )
-    .await?;
-
-    log_wallet_balance_snapshot(
-        program,
-        market_state,
-        &liquidity_provider.pubkey(),
-        balances,
-        "pre_jupiter_order",
-        cycle_id,
-        attempt_id,
-        &mut previous_wallet_snapshot,
-    )
-    .await;
-
-    let swap_execution = JupiterUltraClient::new(http_client, jupiter_config)
-        .swap_exact_in(
+    let built_swap = JupiterSwapClient::new(http_client, jupiter_config)
+        .build_exact_in(
             liquidity_provider.clone(),
             input_mint,
             output_mint,
-            swap_amount,
+            lp_output_ata,
+            withdraw_amount,
         )
         .instrument(info_span!(
-            "jupiter.execute",
+            "jupiter.build",
             cycle.id = %cycle_id,
             market.id = market_id,
             lp.authority = %liquidity_provider.pubkey(),
@@ -423,150 +349,93 @@ pub async fn execute_rebalance(
             rebalance.direction = plan.direction.label(),
             jupiter.input_mint = %input_mint,
             jupiter.output_mint = %output_mint,
-            rebalance.swap_input_requested.raw = swap_amount,
+            rebalance.swap_input_requested.raw = withdraw_amount,
         ))
         .await
-        .with_context(|| {
-            format!(
-                "Failed to execute Jupiter Ultra swap {}",
-                plan.direction.label()
-            )
-        })?;
+        .with_context(|| format!("Failed to build Jupiter swap {}", plan.direction.label()))?;
 
-    log_wallet_balance_snapshot(
+    let (deposit_base_lamports, deposit_quote_lamports) = match plan.direction {
+        SwapDirection::BaseToQuote => (0, built_swap.minimum_output),
+        SwapDirection::QuoteToBase => (built_swap.minimum_output, 0),
+    };
+    ensure!(
+        deposit_base_lamports > 0 || deposit_quote_lamports > 0,
+        "Jupiter build produced no minimum output to add back after rebalance"
+    );
+
+    let add_ix = build_add_liquidity_instruction(
         program,
-        market_state,
-        &liquidity_provider.pubkey(),
-        balances,
-        "post_jupiter_execute",
-        cycle_id,
-        attempt_id,
-        &mut previous_wallet_snapshot,
+        market_id,
+        crate::twob_anchor::client::args::AddLiquidity {
+            reference_index,
+            base_lamports: deposit_base_lamports,
+            quote_lamports: deposit_quote_lamports,
+        },
     )
-    .await;
+    .await
+    .context("Failed to build add_liquidity instruction for atomic rebalance")?;
 
-    let available_budget = withdraw_amount;
-    let external_wallet_input_estimated =
-        telemetry::external_wallet_input_estimated(swap_execution.input_consumed, available_budget);
+    let mut atomic_instructions = Vec::new();
+    atomic_instructions.extend(built_swap.setup_instructions.iter().cloned());
+    atomic_instructions.push(withdraw_ix);
+    atomic_instructions.push(built_swap.swap_instruction.clone());
+    atomic_instructions.push(add_ix);
+    if let Some(cleanup_ix) = &built_swap.cleanup_instruction {
+        atomic_instructions.push(cleanup_ix.clone());
+    }
+    atomic_instructions.extend(built_swap.other_instructions.iter().cloned());
+    if let Some(tip_ix) = &built_swap.tip_instruction {
+        atomic_instructions.push(tip_ix.clone());
+    }
+
     info!(
-        event.name = "jupiter_swap_completed",
+        event.name = "rebalance_atomic_transaction_planned",
         cycle.id = %cycle_id,
         market.id = market_id,
         lp.authority = %liquidity_provider.pubkey(),
         rebalance.attempt_id = %attempt_id,
         rebalance.direction = plan.direction.label(),
-        rebalance.available_budget.raw = available_budget,
-        rebalance.withdrawn_input.raw = withdraw_amount,
-        rebalance.wallet_input_before.raw = existing_input_balance,
-        rebalance.swap_input_requested.raw = swap_amount,
-        jupiter.input_consumed.raw = swap_execution.input_consumed,
-        jupiter.output_received.raw = swap_execution.output_received,
-        jupiter.external_wallet_input_estimated.raw = external_wallet_input_estimated,
-        jupiter.request_id = ?swap_execution.request_id,
-        jupiter.router = ?swap_execution.router,
-        jupiter.slippage_bps = ?swap_execution.slippage_bps,
-        jupiter.price_impact_bps = ?swap_execution.price_impact_bps,
-        jupiter.signature = ?swap_execution.signature,
-        monotonic_counter.jupiter_executes_total = 1_u64,
-    );
-    if external_wallet_input_estimated > dust_threshold_for_mint(&input_mint) {
-        warn!(
-            event.name = "wallet_external_spend_suspected",
-            cycle.id = %cycle_id,
-            market.id = market_id,
-            lp.authority = %liquidity_provider.pubkey(),
-            rebalance.attempt_id = %attempt_id,
-            rebalance.direction = plan.direction.label(),
-            rebalance.available_budget.raw = available_budget,
-            rebalance.withdrawn_input.raw = withdraw_amount,
-            rebalance.wallet_input_before.raw = existing_input_balance,
-            rebalance.swap_input_requested.raw = swap_amount,
-            jupiter.input_consumed.raw = swap_execution.input_consumed,
-            jupiter.external_wallet_input_estimated.raw = external_wallet_input_estimated,
-            monotonic_counter.wallet_external_spend_suspected_total = 1_u64,
-            "Jupiter consumed more input than the amount withdrawn by this rebalance"
-        );
-    }
-
-    let (mut deposit_base_lamports, mut deposit_quote_lamports) = match plan.direction {
-        SwapDirection::BaseToQuote => (
-            swap_amount.saturating_sub(swap_execution.input_consumed),
-            swap_execution.output_received,
-        ),
-        SwapDirection::QuoteToBase => (
-            swap_execution.output_received,
-            swap_amount.saturating_sub(swap_execution.input_consumed),
-        ),
-    };
-
-    ensure!(
-        deposit_base_lamports > 0 || deposit_quote_lamports > 0,
-        "Jupiter swap produced no liquidity to add back after rebalance"
-    );
-
-    deposit_base_lamports = prepare_deposit_balance(
-        program,
-        &market_state.market.base_mint,
-        &liquidity_provider.pubkey(),
-        deposit_base_lamports,
-        liquidity_provider.clone(),
-    )
-    .await?;
-    deposit_quote_lamports = prepare_deposit_balance(
-        program,
-        &market_state.market.quote_mint,
-        &liquidity_provider.pubkey(),
-        deposit_quote_lamports,
-        liquidity_provider.clone(),
-    )
-    .await?;
-
-    ensure!(
-        deposit_base_lamports > 0 || deposit_quote_lamports > 0,
-        "No settled Jupiter output is available to add back after rebalance"
-    );
-
-    log_wallet_balance_snapshot(
-        program,
-        market_state,
-        &liquidity_provider.pubkey(),
-        balances,
-        "pre_add_liquidity",
-        cycle_id,
-        attempt_id,
-        &mut previous_wallet_snapshot,
-    )
-    .await;
-
-    let add_reference_index =
-        oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
-    execute_add_liquidity(
-        program,
-        market_id,
-        deposit_base_lamports,
-        deposit_quote_lamports,
-        add_reference_index,
-        liquidity_provider.clone(),
-    )
-    .instrument(info_span!(
-        "twob.add_liquidity",
-        cycle.id = %cycle_id,
-        market.id = market_id,
-        rebalance.attempt_id = %attempt_id,
-        twob.instruction = "add_liquidity",
-        twob.reference_index = add_reference_index,
+        twob.reference_index = reference_index,
+        rebalance.withdraw_base.raw = withdraw_plan.withdraw_base_lamports,
+        rebalance.withdraw_quote.raw = withdraw_plan.withdraw_quote_lamports,
         rebalance.deposit_base.raw = deposit_base_lamports,
         rebalance.deposit_quote.raw = deposit_quote_lamports,
+        rebalance.withdrawn_input.raw = withdraw_amount,
+        rebalance.swap_input_requested.raw = built_swap.input_amount,
+        jupiter.expected_output.raw = built_swap.expected_output,
+        jupiter.minimum_output.raw = built_swap.minimum_output,
+        jupiter.slippage_bps = built_swap.slippage_bps,
+        jupiter.price_impact_bps = ?built_swap.price_impact_bps,
+        jupiter.route_labels = ?built_swap.route_labels,
+        transaction.instruction_count = atomic_instructions.len(),
+        transaction.lookup_table_count = built_swap.address_lookup_tables.len(),
+    );
+
+    let execution = execute_atomic_rebalance_transaction(
+        program,
+        liquidity_provider.clone(),
+        &built_swap,
+        atomic_instructions,
+        jupiter_config,
+        cycle_id,
+        attempt_id,
+    )
+    .instrument(info_span!(
+        "rebalance.atomic_transaction",
+        cycle.id = %cycle_id,
+        market.id = market_id,
+        lp.authority = %liquidity_provider.pubkey(),
+        rebalance.attempt_id = %attempt_id,
+        rebalance.direction = plan.direction.label(),
     ))
-    .await
-    .context("Failed to add rebalanced liquidity back to the position")?;
+    .await?;
 
     log_wallet_balance_snapshot(
         program,
         market_state,
         &liquidity_provider.pubkey(),
         balances,
-        "post_add_liquidity",
+        "post_atomic_rebalance",
         cycle_id,
         attempt_id,
         &mut previous_wallet_snapshot,
@@ -580,66 +449,302 @@ pub async fn execute_rebalance(
         rebalance.attempt_id = %attempt_id,
         rebalance.direction = plan.direction.label(),
         rebalance.outcome = "executed",
-        jupiter.request_id = ?swap_execution.request_id,
-        jupiter.router = ?swap_execution.router,
-        jupiter.slippage_bps = ?swap_execution.slippage_bps,
-        jupiter.price_impact_bps = ?swap_execution.price_impact_bps,
-        jupiter.signature = ?swap_execution.signature,
-        jupiter.input_consumed.raw = swap_execution.input_consumed,
-        jupiter.output_received.raw = swap_execution.output_received,
+        twob.signature = %execution.signature,
+        jupiter.slippage_bps = built_swap.slippage_bps,
+        jupiter.price_impact_bps = ?built_swap.price_impact_bps,
+        jupiter.input_consumed.raw = built_swap.input_amount,
+        jupiter.minimum_output.raw = built_swap.minimum_output,
+        jupiter.expected_output.raw = built_swap.expected_output,
         rebalance.deposit_base.raw = deposit_base_lamports,
         rebalance.deposit_quote.raw = deposit_quote_lamports,
+        transaction.compute_unit_limit = execution.compute_unit_limit,
+        transaction.compute_units_consumed = ?execution.compute_units_consumed,
+        monotonic_counter.jupiter_executes_total = 1_u64,
     );
 
     Ok(RebalanceOutcome::Executed)
 }
 
+#[derive(Debug, Clone)]
+struct AtomicRebalanceExecution {
+    signature: Signature,
+    compute_unit_limit: u32,
+    compute_units_consumed: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn execute_exact_withdraw_liquidity(
+async fn execute_atomic_rebalance_transaction(
     program: &Program<Arc<Keypair>>,
-    market_id: u64,
-    reference_index: u64,
     signer: Arc<Keypair>,
-    plan: RebalancePlan,
-) -> anyhow::Result<RebalancePlan> {
-    let ix = build_withdraw_liquidity_instruction(
-        program,
-        market_id,
-        crate::twob_anchor::client::args::WithdrawLiquidity {
-            reference_index,
-            base_lamports: plan.withdraw_base_lamports,
-            quote_lamports: plan.withdraw_quote_lamports,
-        },
-    )
-    .await?;
+    built_swap: &BuiltSwap,
+    body_instructions: Vec<Instruction>,
+    jupiter_config: &JupiterConfig,
+    cycle_id: &str,
+    attempt_id: &str,
+) -> anyhow::Result<AtomicRebalanceExecution> {
+    let compute_price_instructions = compute_price_instructions(
+        built_swap,
+        jupiter_config.fallback_compute_unit_price_micro_lamports,
+    );
+    let (recent_blockhash, last_valid_block_height) = program
+        .rpc()
+        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        .await
+        .context("Failed to fetch latest blockhash for atomic rebalance")?;
 
-    let signed_tx = program
-        .request()
-        .instruction(ix)
-        .signer(signer.clone())
-        .signed_transaction()
-        .await?;
+    let simulation_limit = MAX_COMPUTE_UNIT_LIMIT;
+    let simulation_instructions = atomic_transaction_instructions(
+        simulation_limit,
+        &compute_price_instructions,
+        &body_instructions,
+    );
+    let simulation_tx = build_versioned_transaction(
+        signer.as_ref(),
+        &simulation_instructions,
+        &built_swap.address_lookup_tables,
+        recent_blockhash,
+    )?;
+    let simulation = program
+        .rpc()
+        .simulate_transaction_with_config(
+            &simulation_tx,
+            RpcSimulateTransactionConfig {
+                sig_verify: false,
+                replace_recent_blockhash: false,
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..RpcSimulateTransactionConfig::default()
+            },
+        )
+        .await
+        .context("Failed to simulate atomic rebalance transaction")?;
 
-    let simulation = program.rpc().simulate_transaction(&signed_tx).await?;
-    if let Some(err) = simulation.value.err {
+    if let Some(error) = simulation.value.err {
         anyhow::bail!(
-            "Withdraw simulation failed. err={:?} logs={:?}",
-            err,
+            "Atomic rebalance simulation failed. err={:?} logs={:?}",
+            error,
             simulation.value.logs
         );
     }
 
-    execute_withdraw_liquidity(
+    let compute_unit_limit = estimated_compute_unit_limit(simulation.value.units_consumed);
+    info!(
+        event.name = "rebalance_atomic_transaction_simulated",
+        cycle.id = %cycle_id,
+        rebalance.attempt_id = %attempt_id,
+        transaction.compute_unit_limit_simulation = simulation_limit,
+        transaction.compute_unit_limit = compute_unit_limit,
+        transaction.compute_units_consumed = ?simulation.value.units_consumed,
+        transaction.loaded_accounts_data_size = ?simulation.value.loaded_accounts_data_size,
+    );
+
+    let final_instructions = atomic_transaction_instructions(
+        compute_unit_limit,
+        &compute_price_instructions,
+        &body_instructions,
+    );
+    let final_tx = build_versioned_transaction(
+        signer.as_ref(),
+        &final_instructions,
+        &built_swap.address_lookup_tables,
+        recent_blockhash,
+    )?;
+    let final_simulation = program
+        .rpc()
+        .simulate_transaction_with_config(
+            &final_tx,
+            RpcSimulateTransactionConfig {
+                sig_verify: false,
+                replace_recent_blockhash: false,
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..RpcSimulateTransactionConfig::default()
+            },
+        )
+        .await
+        .context("Failed to simulate final atomic rebalance transaction")?;
+
+    if let Some(error) = final_simulation.value.err {
+        anyhow::bail!(
+            "Final atomic rebalance simulation failed. err={:?} logs={:?}",
+            error,
+            final_simulation.value.logs
+        );
+    }
+
+    if jupiter_config.dry_run {
+        anyhow::bail!("JUPITER_DRY_RUN=true prevents sending atomic rebalance transactions");
+    }
+
+    let signature = send_and_confirm_atomic_transaction(
         program,
-        market_id,
-        plan.withdraw_base_lamports,
-        plan.withdraw_quote_lamports,
-        reference_index,
-        signer,
+        &final_tx,
+        last_valid_block_height,
+        cycle_id,
+        attempt_id,
     )
     .await?;
 
-    Ok(plan)
+    Ok(AtomicRebalanceExecution {
+        signature,
+        compute_unit_limit,
+        compute_units_consumed: final_simulation.value.units_consumed,
+    })
+}
+
+const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+const COMPUTE_UNIT_LIMIT_HEADROOM_NUMERATOR: u64 = 12;
+const COMPUTE_UNIT_LIMIT_HEADROOM_DENOMINATOR: u64 = 10;
+const CONFIRM_POLL_DELAY: Duration = Duration::from_millis(400);
+const RESEND_INTERVAL: Duration = Duration::from_secs(2);
+
+fn compute_price_instructions(
+    built_swap: &BuiltSwap,
+    fallback_compute_unit_price_micro_lamports: u64,
+) -> Vec<Instruction> {
+    let mut instructions = without_compute_unit_limit(&built_swap.compute_budget_instructions);
+    if !has_compute_unit_price(&instructions) {
+        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+            fallback_compute_unit_price_micro_lamports,
+        ));
+    }
+    instructions
+}
+
+fn atomic_transaction_instructions(
+    compute_unit_limit: u32,
+    compute_price_instructions: &[Instruction],
+    body_instructions: &[Instruction],
+) -> Vec<Instruction> {
+    let mut instructions =
+        Vec::with_capacity(1 + compute_price_instructions.len() + body_instructions.len());
+    instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
+        compute_unit_limit,
+    ));
+    instructions.extend(compute_price_instructions.iter().cloned());
+    instructions.extend(body_instructions.iter().cloned());
+    instructions
+}
+
+fn estimated_compute_unit_limit(units_consumed: Option<u64>) -> u32 {
+    let estimated = units_consumed.unwrap_or(u64::from(MAX_COMPUTE_UNIT_LIMIT));
+    let with_headroom = estimated
+        .saturating_mul(COMPUTE_UNIT_LIMIT_HEADROOM_NUMERATOR)
+        .saturating_add(COMPUTE_UNIT_LIMIT_HEADROOM_DENOMINATOR - 1)
+        / COMPUTE_UNIT_LIMIT_HEADROOM_DENOMINATOR;
+    with_headroom.clamp(1, u64::from(MAX_COMPUTE_UNIT_LIMIT)) as u32
+}
+
+fn build_versioned_transaction(
+    signer: &Keypair,
+    instructions: &[Instruction],
+    lookup_tables: &[anchor_client::solana_sdk::address_lookup_table::AddressLookupTableAccount],
+    recent_blockhash: anchor_client::solana_sdk::hash::Hash,
+) -> anyhow::Result<VersionedTransaction> {
+    let message = MessageV0::try_compile(
+        &signer.pubkey(),
+        instructions,
+        lookup_tables,
+        recent_blockhash,
+    )
+    .context("Failed to compile atomic rebalance v0 message")?;
+    let signers: [&dyn Signer; 1] = [signer];
+    VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
+        .context("Failed to sign atomic rebalance transaction")
+}
+
+async fn send_and_confirm_atomic_transaction(
+    program: &Program<Arc<Keypair>>,
+    transaction: &VersionedTransaction,
+    last_valid_block_height: u64,
+    cycle_id: &str,
+    attempt_id: &str,
+) -> anyhow::Result<Signature> {
+    let send_config = RpcSendTransactionConfig {
+        skip_preflight: true,
+        max_retries: Some(0),
+        preflight_commitment: Some(CommitmentConfig::confirmed().commitment),
+        ..RpcSendTransactionConfig::default()
+    };
+
+    let signature = program
+        .rpc()
+        .send_transaction_with_config(transaction, send_config)
+        .await
+        .context("Failed to send atomic rebalance transaction")?;
+    info!(
+        event.name = "rebalance_atomic_transaction_submitted",
+        cycle.id = %cycle_id,
+        rebalance.attempt_id = %attempt_id,
+        twob.signature = %signature,
+        transaction.last_valid_block_height = last_valid_block_height,
+    );
+
+    let mut last_resend_at = Instant::now();
+    loop {
+        if let Some(status) = program
+            .rpc()
+            .get_signature_status_with_commitment(&signature, CommitmentConfig::confirmed())
+            .await
+            .context("Failed to fetch atomic rebalance signature status")?
+        {
+            if let Err(error) = status {
+                anyhow::bail!(
+                    "Atomic rebalance transaction failed: signature={} error={:?}",
+                    signature,
+                    error
+                );
+            }
+            info!(
+                event.name = "rebalance_atomic_transaction_confirmed",
+                cycle.id = %cycle_id,
+                rebalance.attempt_id = %attempt_id,
+                twob.signature = %signature,
+            );
+            return Ok(signature);
+        }
+
+        let current_block_height = program
+            .rpc()
+            .get_block_height()
+            .await
+            .context("Failed to fetch block height while confirming atomic rebalance")?;
+        if current_block_height > last_valid_block_height {
+            anyhow::bail!(
+                "Atomic rebalance transaction expired before confirmation: signature={} current_block_height={} last_valid_block_height={}",
+                signature,
+                current_block_height,
+                last_valid_block_height
+            );
+        }
+
+        if last_resend_at.elapsed() >= RESEND_INTERVAL {
+            match program
+                .rpc()
+                .send_transaction_with_config(transaction, send_config)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        event.name = "rebalance_atomic_transaction_resent",
+                        cycle.id = %cycle_id,
+                        rebalance.attempt_id = %attempt_id,
+                        twob.signature = %signature,
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        event.name = "rebalance_atomic_transaction_resend_failed",
+                        cycle.id = %cycle_id,
+                        rebalance.attempt_id = %attempt_id,
+                        twob.signature = %signature,
+                        ?error,
+                    );
+                }
+            }
+            last_resend_at = Instant::now();
+        }
+
+        sleep(CONFIRM_POLL_DELAY).await;
+    }
 }
 
 async fn log_rebalance_transfer_accounts(
@@ -947,10 +1052,6 @@ fn cap_rebalance_to_withdrawable(
 
 /// Pubkey of the native SOL mint (wSOL).
 const NATIVE_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-/// Lamports kept in the native wallet to cover transaction fees when we close the ATA.
-const FEE_RESERVE_LAMPORTS: u64 = 10_000_000; // 0.01 SOL
-const BALANCE_POLL_ATTEMPTS: usize = 8;
-const BALANCE_POLL_DELAY: Duration = Duration::from_millis(750);
 const DEFAULT_TOKEN_DUST_RAW: u64 = 10;
 const NATIVE_SOL_DUST_LAMPORTS: u64 = 10_000;
 
@@ -1078,69 +1179,6 @@ fn clamp_delta(delta: i128) -> i64 {
     delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-async fn prepare_wsol_input_for_jupiter(
-    program: &Program<Arc<Keypair>>,
-    input_mint: &Pubkey,
-    wsol_ata: &Pubkey,
-    swap_amount: u64,
-    signer: Arc<Keypair>,
-) -> anyhow::Result<()> {
-    if !is_native_sol_mint(input_mint) {
-        return Ok(());
-    }
-
-    let lp_pubkey = signer.pubkey();
-    let wsol_balance = read_ata_balance_or_zero(program, wsol_ata).await?;
-
-    if wsol_balance > 0 {
-        info!(
-            event.name = "jupiter_wsol_input_unwrap",
-            wallet.wsol_ata.address = %wsol_ata,
-            wallet.wsol_ata.raw = wsol_balance,
-            rebalance.swap_input_requested.raw = swap_amount,
-        );
-        let close_ix = anchor_spl::token::spl_token::instruction::close_account(
-            &anchor_spl::token::spl_token::ID,
-            wsol_ata,
-            &lp_pubkey,
-            &lp_pubkey,
-            &[],
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to build close_account instruction: {e}"))?;
-
-        program
-            .request()
-            .instruction(close_ix)
-            .signer(signer.clone())
-            .send()
-            .await
-            .context("Failed to close wSOL ATA")?;
-    }
-
-    let required_native = swap_amount
-        .checked_add(FEE_RESERVE_LAMPORTS)
-        .context("SOL swap amount plus fee reserve overflowed")?;
-    let native_balance = wait_for_native_balance_at_least(program, &lp_pubkey, required_native)
-        .await
-        .context("Failed to confirm native SOL balance before Jupiter swap")?;
-
-    info!(
-        event.name = "jupiter_native_sol_input_ready",
-        wallet.native_sol.lamports = native_balance,
-        rebalance.swap_input_requested.raw = swap_amount,
-        wallet.native_sol_fee_reserve.lamports = FEE_RESERVE_LAMPORTS,
-    );
-
-    ensure!(
-        native_balance >= required_native,
-        "Insufficient native SOL for Jupiter swap: balance={} required={}",
-        native_balance,
-        required_native
-    );
-
-    Ok(())
-}
-
 async fn read_ata_balance_or_zero(
     program: &Program<Arc<Keypair>>,
     token_account: &Pubkey,
@@ -1163,165 +1201,6 @@ async fn read_token_account(
         .await
         .with_context(|| format!("Failed to fetch token account {}", token_account))?;
     Ok(response.value)
-}
-
-async fn read_swap_input_balance(
-    program: &Program<Arc<Keypair>>,
-    input_mint: &Pubkey,
-    input_ata: &Pubkey,
-    owner: &Pubkey,
-) -> anyhow::Result<u64> {
-    if is_native_sol_mint(input_mint) {
-        let native_balance = program
-            .rpc()
-            .get_balance(owner)
-            .await
-            .context("Failed to read LP native SOL balance")?
-            .saturating_sub(FEE_RESERVE_LAMPORTS);
-        let wsol_balance = read_ata_balance_or_zero(program, input_ata).await?;
-        return Ok(native_balance.saturating_add(wsol_balance));
-    }
-
-    read_ata_balance_or_zero(program, input_ata).await
-}
-
-async fn wait_for_ata_balance_at_least(
-    program: &Program<Arc<Keypair>>,
-    token_account: &Pubkey,
-    expected_amount: u64,
-) -> anyhow::Result<u64> {
-    let mut last_balance = 0;
-    for attempt in 0..BALANCE_POLL_ATTEMPTS {
-        last_balance = read_ata_balance_or_zero(program, token_account).await?;
-        if last_balance >= expected_amount {
-            return Ok(last_balance);
-        }
-        if attempt + 1 < BALANCE_POLL_ATTEMPTS {
-            sleep(BALANCE_POLL_DELAY).await;
-        }
-    }
-    Ok(last_balance)
-}
-
-async fn wait_for_native_balance_at_least(
-    program: &Program<Arc<Keypair>>,
-    owner: &Pubkey,
-    expected_amount: u64,
-) -> anyhow::Result<u64> {
-    let mut last_balance = 0;
-    for attempt in 0..BALANCE_POLL_ATTEMPTS {
-        last_balance = program
-            .rpc()
-            .get_balance(owner)
-            .await
-            .context("Failed to read native SOL balance")?;
-        if last_balance >= expected_amount {
-            return Ok(last_balance);
-        }
-        if attempt + 1 < BALANCE_POLL_ATTEMPTS {
-            sleep(BALANCE_POLL_DELAY).await;
-        }
-    }
-    Ok(last_balance)
-}
-
-async fn prepare_deposit_balance(
-    program: &Program<Arc<Keypair>>,
-    mint: &Pubkey,
-    owner: &Pubkey,
-    requested_amount: u64,
-    signer: Arc<Keypair>,
-) -> anyhow::Result<u64> {
-    if requested_amount == 0 {
-        return Ok(0);
-    }
-
-    let token_program = get_token_program_id(program, mint).await?;
-    let ata = get_associated_token_address_with_program_id(owner, mint, &token_program);
-
-    if is_native_sol_mint(mint) {
-        return prepare_wsol_deposit_balance(program, &ata, requested_amount, signer).await;
-    }
-
-    let available = wait_for_ata_balance_at_least(program, &ata, requested_amount).await?;
-    if available < requested_amount {
-        warn!(
-            event.name = "rebalance_deposit_capped",
-            token.mint = %mint,
-            rebalance.deposit_requested.raw = requested_amount,
-            rebalance.deposit_available.raw = available,
-        );
-    }
-    Ok(available.min(requested_amount))
-}
-
-async fn prepare_wsol_deposit_balance(
-    program: &Program<Arc<Keypair>>,
-    wsol_ata: &Pubkey,
-    requested_amount: u64,
-    signer: Arc<Keypair>,
-) -> anyhow::Result<u64> {
-    let current_wsol = read_ata_balance_or_zero(program, wsol_ata).await?;
-    if current_wsol >= requested_amount {
-        return Ok(requested_amount);
-    }
-
-    let owner = signer.pubkey();
-    let deficit = requested_amount - current_wsol;
-    let required_native = deficit
-        .checked_add(FEE_RESERVE_LAMPORTS)
-        .context("wSOL wrap amount plus fee reserve overflowed")?;
-    let native_balance = wait_for_native_balance_at_least(program, &owner, required_native).await?;
-    let wrap_amount = native_balance
-        .saturating_sub(FEE_RESERVE_LAMPORTS)
-        .min(deficit);
-
-    if wrap_amount == 0 {
-        warn!(
-            event.name = "rebalance_wsol_deposit_capped",
-            rebalance.deposit_requested.raw = requested_amount,
-            rebalance.deposit_available.raw = current_wsol,
-            wallet.native_sol.lamports = native_balance,
-        );
-        return Ok(current_wsol.min(requested_amount));
-    }
-
-    let native_mint = native_sol_mint();
-    let create_ata_ix =
-        anchor_spl::associated_token::spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-            &owner,
-            &owner,
-            &native_mint,
-            &anchor_spl::token::spl_token::ID,
-        );
-    let transfer_ix = system_instruction::transfer(&owner, wsol_ata, wrap_amount);
-    let sync_ix = anchor_spl::token::spl_token::instruction::sync_native(
-        &anchor_spl::token::spl_token::ID,
-        wsol_ata,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to build sync_native instruction: {e}"))?;
-
-    program
-        .request()
-        .instruction(create_ata_ix)
-        .instruction(transfer_ix)
-        .instruction(sync_ix)
-        .signer(signer)
-        .send()
-        .await
-        .context("Failed to wrap native SOL for add_liquidity")?;
-
-    let expected_wsol = current_wsol.saturating_add(wrap_amount);
-    let final_wsol = wait_for_ata_balance_at_least(program, wsol_ata, expected_wsol).await?;
-    if final_wsol < requested_amount {
-        warn!(
-            event.name = "rebalance_wsol_deposit_capped_after_wrap",
-            wallet.wsol_ata.address = %wsol_ata,
-            rebalance.deposit_requested.raw = requested_amount,
-            rebalance.deposit_available.raw = final_wsol,
-        );
-    }
-    Ok(final_wsol.min(requested_amount))
 }
 
 fn native_sol_mint() -> Pubkey {

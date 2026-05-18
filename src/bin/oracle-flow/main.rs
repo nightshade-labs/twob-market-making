@@ -49,7 +49,6 @@ async fn main() -> anyhow::Result<()> {
     let optimal_quote_weight = config.optimal_quote_weight;
     let flow_reduction_factor = config.flow_reduction_factor;
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
-    let rebalance_cooldown = Duration::from_secs(config.rebalance_cooldown_secs);
     let min_rebalance_value_usd = config.min_rebalance_value_usd;
     let is_devnet = config.rpc_url.contains("devnet");
     let price_feed_url = config.price_feed_url;
@@ -83,13 +82,14 @@ async fn main() -> anyhow::Result<()> {
         quote.optimal_weight = optimal_quote_weight,
         jupiter.api_key_configured = jupiter_config.api_key.is_some(),
         jupiter.dry_run = jupiter_config.dry_run,
+        jupiter.swap_api_base_url = %jupiter_config.swap_api_base_url,
+        jupiter.compute_unit_price_percentile = %jupiter_config.compute_unit_price_percentile,
+        jupiter.max_accounts = jupiter_config.max_accounts,
         solana.devnet_mode = is_devnet,
-        rebalance.cooldown_secs = rebalance_cooldown.as_secs(),
         rebalance.min_value_usd = min_rebalance_value_usd,
         balance_snapshot_interval_secs = telemetry_config.balance_snapshot_interval_secs,
     );
 
-    let mut last_rebalance_at: Option<Instant> = None;
     let mut cycle_number = 0_u64;
 
     loop {
@@ -118,8 +118,6 @@ async fn main() -> anyhow::Result<()> {
                     optimal_quote_weight,
                     flow_reduction_factor,
                     max_flow_reduction_attempts,
-                    last_rebalance_at,
-                    rebalance_cooldown,
                     min_rebalance_value_usd,
                     &jupiter_config,
                     is_devnet,
@@ -128,8 +126,7 @@ async fn main() -> anyhow::Result<()> {
                     liquidity_provider.clone(),
                     &cycle_id,
                 ).instrument(cycle_span).await {
-                    Ok(Some(rebalanced_at)) => last_rebalance_at = Some(rebalanced_at),
-                    Ok(None) => {}
+                    Ok(()) => {}
                     Err(error) => {
                         error!(
                             event.name = "oracle_flow_cycle_error",
@@ -161,8 +158,6 @@ async fn run_update_cycle(
     optimal_quote_weight: f64,
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
-    last_rebalance_at: Option<Instant>,
-    rebalance_cooldown: Duration,
     min_rebalance_value_usd: f64,
     jupiter_config: &JupiterConfig,
     is_devnet: bool,
@@ -170,7 +165,7 @@ async fn run_update_cycle(
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
     liquidity_provider: Arc<anchor_client::solana_sdk::signature::Keypair>,
     cycle_id: &str,
-) -> anyhow::Result<Option<Instant>> {
+) -> anyhow::Result<()> {
     let cycle_started_at = Instant::now();
     let cycle_ts = chrono::Utc::now();
     info!(
@@ -221,14 +216,7 @@ async fn run_update_cycle(
     );
 
     // 3. Check if rebalance is needed
-    let mut new_rebalance_at: Option<Instant> = None;
-
-    let in_cooldown = last_rebalance_at
-        .map(|t| t.elapsed() < rebalance_cooldown)
-        .unwrap_or(false);
-    let rebalance_needed = if in_cooldown {
-        false
-    } else {
+    let rebalance_needed = {
         let rebalance_evaluate_span = info_span!(
             "rebalance.evaluate",
             cycle.id = %cycle_id,
@@ -246,19 +234,7 @@ async fn run_update_cycle(
         )
     };
 
-    if in_cooldown {
-        let elapsed = last_rebalance_at.unwrap().elapsed();
-        info!(
-            event.name = "rebalance_skipped",
-            cycle.id = %cycle_id,
-            market.id = market_id,
-            lp.authority = %authority,
-            rebalance.reason = "cooldown_active",
-            rebalance.cooldown_elapsed_secs = elapsed.as_secs(),
-            rebalance.cooldown_required_secs = rebalance_cooldown.as_secs(),
-            monotonic_counter.rebalance_skips_total = 1_u64,
-        );
-    } else if rebalance_needed {
+    if rebalance_needed {
         let attempt_started_at = Instant::now();
         let attempt_id = format!("{}-rebalance-{}", cycle_id, cycle_ts.timestamp_millis());
         info!(
@@ -301,7 +277,6 @@ async fn run_update_cycle(
 
         match rebalance_result {
             Ok(RebalanceOutcome::Executed) => {
-                new_rebalance_at = Some(attempt_started_at);
                 match refresh_position_state(program, market_id, authority)
                     .instrument(info_span!(
                         "state.refresh",
@@ -327,7 +302,7 @@ async fn run_update_cycle(
                             ?error,
                             "rebalance completed but refresh failed; skipping quote update"
                         );
-                        return Ok(new_rebalance_at);
+                        return Ok(());
                     }
                 }
                 info!(
@@ -337,7 +312,6 @@ async fn run_update_cycle(
                     lp.authority = %authority,
                     rebalance.attempt_id = %attempt_id,
                     rebalance.outcome = "executed",
-                    rebalance.cooldown_secs = rebalance_cooldown.as_secs(),
                     histogram.rebalance_duration_ms = attempt_started_at.elapsed().as_millis() as f64,
                 );
             }
@@ -354,7 +328,6 @@ async fn run_update_cycle(
                 );
             }
             Err(error) => {
-                new_rebalance_at = Some(attempt_started_at);
                 error!(
                     event.name = "rebalance_failed",
                     cycle.id = %cycle_id,
@@ -362,10 +335,9 @@ async fn run_update_cycle(
                     lp.authority = %authority,
                     rebalance.attempt_id = %attempt_id,
                     rebalance.outcome = "error",
-                    rebalance.cooldown_secs = rebalance_cooldown.as_secs(),
                     histogram.rebalance_duration_ms = attempt_started_at.elapsed().as_millis() as f64,
                     ?error,
-                    "rebalance failed; cooldown starts now"
+                    "atomic rebalance failed; no liquidity should have moved"
                 );
                 match refresh_position_state(program, market_id, authority)
                     .instrument(info_span!(
@@ -392,7 +364,7 @@ async fn run_update_cycle(
                             ?error,
                             "refresh after rebalance failure failed; skipping quote update"
                         );
-                        return Ok(new_rebalance_at);
+                        return Ok(());
                     }
                 }
             }
@@ -518,7 +490,7 @@ async fn run_update_cycle(
         histogram.cycle_duration_ms = cycle_started_at.elapsed().as_millis() as f64,
     );
 
-    Ok(new_rebalance_at)
+    Ok(())
 }
 
 async fn refresh_position_state(

@@ -1,17 +1,15 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anchor_client::solana_sdk::{
+    address_lookup_table::AddressLookupTableAccount,
+    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    transaction::VersionedTransaction,
 };
 use anyhow::{Context, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
-use tracing::{Instrument, info, info_span, warn};
+use tracing::info;
 
 use crate::config::JupiterConfig;
 
@@ -30,24 +28,30 @@ impl SwapDirection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SwapExecution {
-    pub input_consumed: u64,
-    pub output_received: u64,
-    pub signature: Option<String>,
-    pub request_id: Option<String>,
-    pub router: Option<String>,
-    pub slippage_bps: Option<u64>,
+#[derive(Debug, Clone)]
+pub struct BuiltSwap {
+    pub input_amount: u64,
+    pub expected_output: u64,
+    pub minimum_output: u64,
+    pub slippage_bps: u64,
     pub price_impact_bps: Option<f64>,
+    pub route_labels: Vec<String>,
+    pub compute_budget_instructions: Vec<Instruction>,
+    pub setup_instructions: Vec<Instruction>,
+    pub swap_instruction: Instruction,
+    pub cleanup_instruction: Option<Instruction>,
+    pub other_instructions: Vec<Instruction>,
+    pub tip_instruction: Option<Instruction>,
+    pub address_lookup_tables: Vec<AddressLookupTableAccount>,
 }
 
 #[derive(Debug)]
-pub struct JupiterUltraClient<'a> {
+pub struct JupiterSwapClient<'a> {
     http_client: &'a reqwest::Client,
     config: &'a JupiterConfig,
 }
 
-impl<'a> JupiterUltraClient<'a> {
+impl<'a> JupiterSwapClient<'a> {
     pub fn new(http_client: &'a reqwest::Client, config: &'a JupiterConfig) -> Self {
         Self {
             http_client,
@@ -55,25 +59,28 @@ impl<'a> JupiterUltraClient<'a> {
         }
     }
 
-    pub async fn swap_exact_in(
+    pub async fn build_exact_in(
         &self,
         liquidity_provider: Arc<Keypair>,
         input_mint: Pubkey,
         output_mint: Pubkey,
+        destination_token_account: Pubkey,
         amount: u64,
-    ) -> anyhow::Result<SwapExecution> {
+    ) -> anyhow::Result<BuiltSwap> {
         info!(
-            event.name = "jupiter_swap_requested",
+            event.name = "jupiter_build_requested",
             jupiter.input_mint = %input_mint,
             jupiter.output_mint = %output_mint,
+            jupiter.destination_token_account = %destination_token_account,
             rebalance.swap_input_requested.raw = amount,
-            jupiter.dry_run = self.config.dry_run,
             jupiter.api_key_configured = self
                 .config
                 .api_key
                 .as_deref()
                 .map(|key| !key.trim().is_empty())
                 .unwrap_or(false),
+            jupiter.compute_unit_price_percentile = %self.config.compute_unit_price_percentile,
+            jupiter.max_accounts = self.config.max_accounts,
         );
 
         let api_key = self
@@ -83,154 +90,56 @@ impl<'a> JupiterUltraClient<'a> {
             .filter(|value| !value.trim().is_empty())
             .context("JUPITER_API_KEY is required for oracle-flow rebalancing")?;
 
-        // Jupiter's RPC may lag behind our confirmed withdrawal by a few seconds.
-        // Retry on error-code 1 (Insufficient funds) up to 5 times with increasing delay.
-        const MAX_ORDER_RETRIES: u32 = 5;
-        let order = 'order: {
-            let mut last_err = anyhow::anyhow!("no attempts made");
-            for attempt in 0..MAX_ORDER_RETRIES {
-                if attempt > 0 {
-                    let delay = Duration::from_secs(2u64.pow(attempt));
-                    warn!(
-                        event.name = "jupiter_order_retry",
-                        jupiter.order_attempt = attempt + 1,
-                        jupiter.retry_delay_secs = delay.as_secs(),
-                        "Jupiter order returned insufficient funds; retrying after delay"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
+        let build = self
+            .fetch_build(
+                api_key,
+                &BuildQuery {
+                    input_mint: input_mint.to_string(),
+                    output_mint: output_mint.to_string(),
+                    amount: amount.to_string(),
+                    taker: liquidity_provider.pubkey().to_string(),
+                    payer: Some(liquidity_provider.pubkey().to_string()),
+                    destination_token_account: Some(destination_token_account.to_string()),
+                    slippage_bps: self.config.max_slippage_bps,
+                    max_accounts: self.config.max_accounts,
+                    wrap_and_unwrap_sol: false,
+                    compute_unit_price_percentile: self
+                        .config
+                        .compute_unit_price_percentile
+                        .clone(),
+                    mode: self.config.swap_mode.clone(),
+                },
+            )
+            .await?;
 
-                let order = self
-                    .fetch_order(
-                        api_key,
-                        &OrderQuery {
-                            input_mint: input_mint.to_string(),
-                            output_mint: output_mint.to_string(),
-                            amount: amount.to_string(),
-                            taker: if self.config.dry_run {
-                                None
-                            } else {
-                                Some(liquidity_provider.pubkey().to_string())
-                            },
-                        },
-                    )
-                    .instrument(info_span!(
-                        "jupiter.order",
-                        jupiter.input_mint = %input_mint,
-                        jupiter.output_mint = %output_mint,
-                        rebalance.swap_input_requested.raw = amount,
-                        jupiter.order_attempt = attempt + 1,
-                    ))
-                    .await;
+        build.validate(input_mint, output_mint, amount, self.config)?;
+        let built_swap = build.into_built_swap()?;
 
-                match order {
-                    Ok(o) if o.error_code == Some(1) => {
-                        warn!(
-                            event.name = "jupiter_order_rejected",
-                            jupiter.error_code = 1_u64,
-                            jupiter.error_message =
-                                o.error_message.as_deref().unwrap_or("Insufficient funds"),
-                            jupiter.order_attempt = attempt + 1,
-                        );
-                        last_err = anyhow::anyhow!(
-                            "Jupiter order returned error 1: {} (attempt {})",
-                            o.error_message.as_deref().unwrap_or("Insufficient funds"),
-                            attempt + 1,
-                        );
-                    }
-                    Ok(o) => break 'order o,
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(last_err);
-        };
-
-        order.validate(input_mint, output_mint, amount, self.config)?;
         info!(
-            event.name = "jupiter_order_received",
-            jupiter.request_id = ?order.request_id,
-            jupiter.router = ?order.router,
-            jupiter.slippage_bps = ?order.slippage_bps,
-            jupiter.price_impact_bps = ?order.price_impact_bps(),
-            jupiter.expected_output.raw = ?order.out_amount,
+            event.name = "jupiter_build_received",
+            jupiter.input_mint = %input_mint,
+            jupiter.output_mint = %output_mint,
+            rebalance.swap_input_requested.raw = built_swap.input_amount,
+            jupiter.expected_output.raw = built_swap.expected_output,
+            jupiter.minimum_output.raw = built_swap.minimum_output,
+            jupiter.slippage_bps = built_swap.slippage_bps,
+            jupiter.price_impact_bps = ?built_swap.price_impact_bps,
+            jupiter.route_labels = ?built_swap.route_labels,
+            jupiter.lookup_table_count = built_swap.address_lookup_tables.len(),
             monotonic_counter.jupiter_orders_total = 1_u64,
         );
 
-        if self.config.dry_run {
-            let preview = order
-                .dry_run_execution(amount)
-                .context("Failed to derive Jupiter dry-run swap result from order response")?;
-            info!(
-                event.name = "jupiter_dry_run_preview",
-                jupiter.input_consumed.raw = preview.input_consumed,
-                jupiter.output_received.raw = preview.output_received,
-                jupiter.signature = "None",
-            );
-            return Ok(preview);
-        }
-
-        let request_id = order
-            .request_id
-            .clone()
-            .context("Jupiter order response missing requestId")?;
-        let transaction = order
-            .transaction
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .context("Jupiter order response missing transaction payload")?;
-
-        let signed_transaction = sign_transaction(&transaction, liquidity_provider)?;
-        let execute_response = self
-            .execute_order(api_key, &request_id, &signed_transaction)
-            .instrument(info_span!(
-                "jupiter.execute",
-                jupiter.request_id = %request_id,
-                jupiter.router = ?order.router,
-            ))
-            .await?;
-        execute_response.validate()?;
-
-        let input_consumed = execute_response
-            .input_amount_result
-            .as_deref()
-            .or(execute_response.total_input_amount.as_deref())
-            .context("Jupiter execute response missing input amount result")?
-            .parse::<u64>()
-            .context("Failed to parse Jupiter input amount result")?;
-        let output_received = execute_response
-            .output_amount_result
-            .as_deref()
-            .or(execute_response.out_amount.as_deref())
-            .context("Jupiter execute response missing output amount result")?
-            .parse::<u64>()
-            .context("Failed to parse Jupiter output amount result")?;
-
-        ensure!(
-            input_consumed <= amount,
-            "Jupiter consumed more input than requested: requested={} consumed={}",
-            amount,
-            input_consumed
-        );
-
-        Ok(SwapExecution {
-            input_consumed,
-            output_received,
-            signature: execute_response.signature,
-            request_id: Some(request_id),
-            router: order.router.clone(),
-            slippage_bps: order.slippage_bps,
-            price_impact_bps: order.price_impact_bps(),
-        })
+        Ok(built_swap)
     }
 
-    async fn fetch_order(
+    async fn fetch_build(
         &self,
         api_key: &str,
-        query: &OrderQuery,
-    ) -> anyhow::Result<OrderResponse> {
+        query: &BuildQuery,
+    ) -> anyhow::Result<BuildResponse> {
         let url = format!(
-            "{}/order",
-            self.config.ultra_api_base_url.trim_end_matches('/')
+            "{}/build",
+            self.config.swap_api_base_url.trim_end_matches('/')
         );
         let started_at = Instant::now();
         let response = self
@@ -240,83 +149,292 @@ impl<'a> JupiterUltraClient<'a> {
             .query(query)
             .send()
             .await
-            .context("Failed to request Jupiter Ultra order")?;
+            .context("Failed to request Jupiter swap build")?;
         let status = response.status();
         info!(
-            event.name = "jupiter_order_http_response",
+            event.name = "jupiter_build_http_response",
             http.status_code = status.as_u16(),
             histogram.jupiter_order_latency_ms = started_at.elapsed().as_millis() as f64,
         );
 
-        parse_json_response(response, "Jupiter Ultra order").await
-    }
-
-    async fn execute_order(
-        &self,
-        api_key: &str,
-        request_id: &str,
-        signed_transaction: &str,
-    ) -> anyhow::Result<ExecuteResponse> {
-        let url = format!(
-            "{}/execute",
-            self.config.ultra_api_base_url.trim_end_matches('/')
-        );
-        let started_at = Instant::now();
-        let response = self
-            .http_client
-            .post(&url)
-            .header("x-api-key", api_key)
-            .json(&ExecuteRequest {
-                signed_transaction,
-                request_id,
-            })
-            .send()
-            .await
-            .context("Failed to execute Jupiter Ultra order")?;
-        let status = response.status();
-        info!(
-            event.name = "jupiter_execute_http_response",
-            jupiter.request_id = %request_id,
-            http.status_code = status.as_u16(),
-            histogram.jupiter_execute_latency_ms = started_at.elapsed().as_millis() as f64,
-        );
-
-        parse_json_response(response, "Jupiter Ultra execute").await
+        parse_json_response(response, "Jupiter swap build").await
     }
 }
 
-fn sign_transaction(
-    transaction_base64: &str,
-    liquidity_provider: Arc<Keypair>,
-) -> anyhow::Result<String> {
-    let transaction_bytes = BASE64_STANDARD
-        .decode(transaction_base64)
-        .context("Failed to decode Jupiter transaction payload")?;
-    let mut transaction: VersionedTransaction = bincode::deserialize(&transaction_bytes)
-        .context("Failed to deserialize Jupiter transaction")?;
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildQuery {
+    input_mint: String,
+    output_mint: String,
+    amount: String,
+    taker: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination_token_account: Option<String>,
+    slippage_bps: u64,
+    max_accounts: u64,
+    wrap_and_unwrap_sol: bool,
+    compute_unit_price_percentile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
 
-    // Jupiter Ultra returns a partially-signed transaction: Jupiter holds co-signer slot(s).
-    // try_new() would replace all signatures, destroying theirs. Instead, find our pubkey's
-    // position in the static account keys and insert our signature at that slot only.
-    let our_pubkey = liquidity_provider.pubkey();
-    let signer_index = transaction
-        .message
-        .static_account_keys()
-        .iter()
-        .position(|key| key == &our_pubkey)
-        .with_context(|| {
-            format!(
-                "Our pubkey {} not found in Jupiter transaction account keys",
-                our_pubkey
-            )
-        })?;
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildResponse {
+    input_mint: String,
+    output_mint: String,
+    in_amount: String,
+    out_amount: String,
+    other_amount_threshold: String,
+    slippage_bps: u64,
+    #[serde(default)]
+    price_impact_pct: Option<NumericString>,
+    #[serde(default)]
+    route_plan: Vec<RoutePlanEntry>,
+    #[serde(default)]
+    compute_budget_instructions: Vec<ApiInstruction>,
+    #[serde(default)]
+    setup_instructions: Vec<ApiInstruction>,
+    swap_instruction: ApiInstruction,
+    cleanup_instruction: Option<ApiInstruction>,
+    #[serde(default)]
+    other_instructions: Vec<ApiInstruction>,
+    tip_instruction: Option<ApiInstruction>,
+    #[serde(default)]
+    addresses_by_lookup_table_address: Option<HashMap<String, Vec<String>>>,
+}
 
-    let message_bytes = transaction.message.serialize();
-    transaction.signatures[signer_index] = liquidity_provider.sign_message(&message_bytes);
+impl BuildResponse {
+    fn validate(
+        &self,
+        input_mint: Pubkey,
+        output_mint: Pubkey,
+        amount: u64,
+        config: &JupiterConfig,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            self.input_mint == input_mint.to_string(),
+            "Jupiter build input mint mismatch: expected={} got={}",
+            input_mint,
+            self.input_mint
+        );
+        ensure!(
+            self.output_mint == output_mint.to_string(),
+            "Jupiter build output mint mismatch: expected={} got={}",
+            output_mint,
+            self.output_mint
+        );
+        ensure!(
+            self.in_amount
+                .parse::<u64>()
+                .context("Invalid Jupiter inAmount")?
+                == amount,
+            "Jupiter build amount mismatch: expected={} got={}",
+            amount,
+            self.in_amount
+        );
+        ensure!(
+            self.slippage_bps <= config.max_slippage_bps,
+            "Jupiter slippage too high: {} > {}",
+            self.slippage_bps,
+            config.max_slippage_bps
+        );
 
-    let signed_bytes = bincode::serialize(&transaction)
-        .context("Failed to serialize signed Jupiter transaction")?;
-    Ok(BASE64_STANDARD.encode(signed_bytes))
+        if let Some(price_impact_bps) = self.price_impact_bps() {
+            ensure!(
+                price_impact_bps <= config.max_price_impact_bps as f64,
+                "Jupiter price impact too high: {} bps > {} bps",
+                price_impact_bps,
+                config.max_price_impact_bps
+            );
+        }
+
+        Ok(())
+    }
+
+    fn into_built_swap(self) -> anyhow::Result<BuiltSwap> {
+        let input_amount = self
+            .in_amount
+            .parse::<u64>()
+            .context("Invalid Jupiter inAmount")?;
+        let expected_output = self
+            .out_amount
+            .parse::<u64>()
+            .context("Invalid Jupiter outAmount")?;
+        let minimum_output = self
+            .other_amount_threshold
+            .parse::<u64>()
+            .context("Invalid Jupiter otherAmountThreshold")?;
+
+        ensure!(
+            minimum_output > 0,
+            "Jupiter minimum output rounded to zero for atomic add-liquidity"
+        );
+
+        Ok(BuiltSwap {
+            input_amount,
+            expected_output,
+            minimum_output,
+            slippage_bps: self.slippage_bps,
+            price_impact_bps: self.price_impact_bps(),
+            route_labels: self.route_labels(),
+            compute_budget_instructions: decode_instructions(self.compute_budget_instructions)?,
+            setup_instructions: decode_instructions(self.setup_instructions)?,
+            swap_instruction: self.swap_instruction.try_into_instruction()?,
+            cleanup_instruction: self
+                .cleanup_instruction
+                .map(ApiInstruction::try_into_instruction)
+                .transpose()?,
+            other_instructions: decode_instructions(self.other_instructions)?,
+            tip_instruction: self
+                .tip_instruction
+                .map(ApiInstruction::try_into_instruction)
+                .transpose()?,
+            address_lookup_tables: decode_lookup_tables(self.addresses_by_lookup_table_address)?,
+        })
+    }
+
+    fn price_impact_bps(&self) -> Option<f64> {
+        self.price_impact_pct
+            .as_ref()
+            .map(|impact| impact.value() * 10_000.0)
+    }
+
+    fn route_labels(&self) -> Vec<String> {
+        self.route_plan
+            .iter()
+            .filter_map(|entry| entry.swap_info.label.clone())
+            .collect()
+    }
+}
+
+fn decode_instructions(instructions: Vec<ApiInstruction>) -> anyhow::Result<Vec<Instruction>> {
+    instructions
+        .into_iter()
+        .map(ApiInstruction::try_into_instruction)
+        .collect()
+}
+
+fn decode_lookup_tables(
+    addresses_by_lookup_table_address: Option<HashMap<String, Vec<String>>>,
+) -> anyhow::Result<Vec<AddressLookupTableAccount>> {
+    addresses_by_lookup_table_address
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, addresses)| {
+            Ok(AddressLookupTableAccount {
+                key: key
+                    .parse::<Pubkey>()
+                    .with_context(|| format!("Invalid Jupiter lookup table address {key}"))?,
+                addresses: addresses
+                    .into_iter()
+                    .map(|address| {
+                        address.parse::<Pubkey>().with_context(|| {
+                            format!("Invalid Jupiter lookup table entry {address}")
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutePlanEntry {
+    swap_info: SwapInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapInfo {
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NumericString {
+    String(String),
+    Number(f64),
+}
+
+impl NumericString {
+    fn value(&self) -> f64 {
+        match self {
+            Self::String(value) => value.parse::<f64>().unwrap_or(0.0),
+            Self::Number(value) => *value,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiInstruction {
+    program_id: String,
+    accounts: Vec<ApiAccountMeta>,
+    data: String,
+}
+
+impl ApiInstruction {
+    fn try_into_instruction(self) -> anyhow::Result<Instruction> {
+        Ok(Instruction {
+            program_id: self.program_id.parse::<Pubkey>().with_context(|| {
+                format!("Invalid Jupiter instruction program {}", self.program_id)
+            })?,
+            accounts: self
+                .accounts
+                .into_iter()
+                .map(ApiAccountMeta::try_into_account_meta)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            data: BASE64_STANDARD
+                .decode(self.data.as_bytes())
+                .context("Invalid Jupiter instruction data")?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAccountMeta {
+    pubkey: String,
+    is_signer: bool,
+    is_writable: bool,
+}
+
+impl ApiAccountMeta {
+    fn try_into_account_meta(self) -> anyhow::Result<AccountMeta> {
+        let pubkey = self
+            .pubkey
+            .parse::<Pubkey>()
+            .with_context(|| format!("Invalid Jupiter account meta pubkey {}", self.pubkey))?;
+        Ok(if self.is_writable {
+            AccountMeta::new(pubkey, self.is_signer)
+        } else {
+            AccountMeta::new_readonly(pubkey, self.is_signer)
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiErrorResponse {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+impl ApiErrorResponse {
+    fn message(&self) -> Option<String> {
+        self.message
+            .clone()
+            .or_else(|| self.error_message.clone())
+            .or_else(|| self.error.clone())
+    }
 }
 
 async fn parse_json_response<T>(response: reqwest::Response, label: &str) -> anyhow::Result<T>
@@ -339,221 +457,25 @@ where
         );
     }
 
-    serde_json::from_str(&body).with_context(|| format!("Failed to parse {} response JSON", label))
+    serde_json::from_str(&body).with_context(|| format!("Failed to decode {} response", label))
 }
 
-#[derive(Debug, Serialize)]
-struct OrderQuery {
-    #[serde(rename = "inputMint")]
-    input_mint: String,
-    #[serde(rename = "outputMint")]
-    output_mint: String,
-    amount: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    taker: Option<String>,
+pub fn has_compute_unit_price(instructions: &[Instruction]) -> bool {
+    instructions.iter().any(|instruction| {
+        instruction.program_id == anchor_client::solana_sdk::compute_budget::id()
+            && instruction.data.first() == Some(&3)
+    })
 }
 
-#[derive(Debug, Serialize)]
-struct ExecuteRequest<'a> {
-    #[serde(rename = "signedTransaction")]
-    signed_transaction: &'a str,
-    #[serde(rename = "requestId")]
-    request_id: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OrderResponse {
-    request_id: Option<String>,
-    transaction: Option<String>,
-    input_mint: String,
-    output_mint: String,
-    in_amount: Option<String>,
-    out_amount: Option<String>,
-    slippage_bps: Option<u64>,
-    price_impact: Option<f64>,
-    router: Option<String>,
-    error_code: Option<u64>,
-    error_message: Option<String>,
-}
-
-impl OrderResponse {
-    fn validate(
-        &self,
-        expected_input_mint: Pubkey,
-        expected_output_mint: Pubkey,
-        expected_amount: u64,
-        config: &JupiterConfig,
-    ) -> anyhow::Result<()> {
-        ensure!(
-            self.input_mint == expected_input_mint.to_string(),
-            "Jupiter order input mint mismatch: expected={} actual={}",
-            expected_input_mint,
-            self.input_mint
-        );
-        ensure!(
-            self.output_mint == expected_output_mint.to_string(),
-            "Jupiter order output mint mismatch: expected={} actual={}",
-            expected_output_mint,
-            self.output_mint
-        );
-
-        if let Some(error_code) = self.error_code {
-            anyhow::bail!(
-                "Jupiter order returned error {}: {}",
-                error_code,
-                self.error_message
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
-
-        if let Some(in_amount) = &self.in_amount {
-            let parsed_in_amount = in_amount
-                .parse::<u64>()
-                .context("Failed to parse Jupiter order input amount")?;
-            ensure!(
-                parsed_in_amount == expected_amount,
-                "Jupiter order input amount mismatch: expected={} actual={}",
-                expected_amount,
-                parsed_in_amount
-            );
-        }
-
-        let slippage_bps = self.slippage_bps.unwrap_or_default();
-        ensure!(
-            slippage_bps <= config.max_slippage_bps,
-            "Jupiter order slippage {} bps exceeds configured max {} bps",
-            slippage_bps,
-            config.max_slippage_bps
-        );
-
-        let price_impact_bps = self.price_impact_bps().unwrap_or_default();
-        ensure!(
-            price_impact_bps <= config.max_price_impact_bps as f64,
-            "Jupiter order price impact {:.2} bps exceeds configured max {} bps",
-            price_impact_bps,
-            config.max_price_impact_bps
-        );
-
-        info!(
-            event.name = "jupiter_order_accepted",
-            jupiter.request_id = ?self.request_id,
-            jupiter.router = ?self.router,
-            jupiter.slippage_bps = slippage_bps,
-            jupiter.price_impact_bps = price_impact_bps,
-            jupiter.expected_output.raw = ?self.out_amount,
-        );
-
-        Ok(())
-    }
-
-    fn price_impact_bps(&self) -> Option<f64> {
-        self.price_impact.map(|value| value.abs() * 100.0)
-    }
-
-    fn dry_run_execution(&self, requested_amount: u64) -> anyhow::Result<SwapExecution> {
-        let input_consumed = self
-            .in_amount
-            .as_deref()
-            .map(|value| {
-                value
-                    .parse::<u64>()
-                    .context("Failed to parse Jupiter dry-run input amount")
-            })
-            .transpose()?
-            .unwrap_or(requested_amount);
-        let output_received = self
-            .out_amount
-            .as_deref()
-            .context("Jupiter dry-run response missing outAmount")?
-            .parse::<u64>()
-            .context("Failed to parse Jupiter dry-run output amount")?;
-
-        ensure!(
-            input_consumed <= requested_amount,
-            "Jupiter dry-run input amount exceeds requested amount: requested={} actual={}",
-            requested_amount,
-            input_consumed
-        );
-
-        Ok(SwapExecution {
-            input_consumed,
-            output_received,
-            signature: None,
-            request_id: self.request_id.clone(),
-            router: self.router.clone(),
-            slippage_bps: self.slippage_bps,
-            price_impact_bps: self.price_impact_bps(),
+pub fn without_compute_unit_limit(instructions: &[Instruction]) -> Vec<Instruction> {
+    instructions
+        .iter()
+        .filter(|instruction| {
+            instruction.program_id != anchor_client::solana_sdk::compute_budget::id()
+                || instruction.data.first() != Some(&2)
         })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExecuteResponse {
-    status: Option<String>,
-    code: Option<u64>,
-    signature: Option<String>,
-    error: Option<String>,
-    input_amount_result: Option<String>,
-    output_amount_result: Option<String>,
-    total_input_amount: Option<String>,
-    out_amount: Option<String>,
-}
-
-impl ExecuteResponse {
-    fn validate(&self) -> anyhow::Result<()> {
-        if let Some(code) = self.code {
-            ensure!(
-                code == 0,
-                "Jupiter execute returned error code {}: {}",
-                code,
-                self.error
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
-
-        if let Some(status) = &self.status {
-            ensure!(
-                status.eq_ignore_ascii_case("success"),
-                "Jupiter execute returned non-success status {}: {}",
-                status,
-                self.error
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
-
-        if let Some(error) = &self.error {
-            ensure!(
-                error.trim().is_empty(),
-                "Jupiter execute returned error: {}",
-                error
-            );
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiErrorResponse {
-    error: Option<String>,
-    message: Option<String>,
-    error_message: Option<String>,
-    details: Option<String>,
-}
-
-impl ApiErrorResponse {
-    fn message(self) -> Option<String> {
-        self.error
-            .or(self.message)
-            .or(self.error_message)
-            .or(self.details)
-    }
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -561,59 +483,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_price_impact_percent_to_bps() {
-        let config = JupiterConfig {
-            api_key: Some("test".to_string()),
-            ultra_api_base_url: "https://api.jup.ag/ultra/v1".to_string(),
-            max_slippage_bps: 50,
-            max_price_impact_bps: 50,
-            dry_run: true,
-        };
-        let order = OrderResponse {
-            request_id: Some("req".to_string()),
-            transaction: Some("tx".to_string()),
-            input_mint: Pubkey::new_unique().to_string(),
-            output_mint: Pubkey::new_unique().to_string(),
-            in_amount: Some("100".to_string()),
-            out_amount: Some("99".to_string()),
-            slippage_bps: Some(20),
-            price_impact: Some(0.49),
-            router: Some("aggregator".to_string()),
-            error_code: None,
-            error_message: None,
+    fn decodes_api_instruction() {
+        let api_instruction = ApiInstruction {
+            program_id: "11111111111111111111111111111111".to_string(),
+            accounts: vec![ApiAccountMeta {
+                pubkey: "11111111111111111111111111111111".to_string(),
+                is_signer: true,
+                is_writable: false,
+            }],
+            data: BASE64_STANDARD.encode([1_u8, 2, 3]),
         };
 
-        assert!(
-            order
-                .validate(
-                    order.input_mint.parse().unwrap(),
-                    order.output_mint.parse().unwrap(),
-                    100,
-                    &config,
-                )
-                .is_ok()
-        );
+        let instruction = api_instruction.try_into_instruction().unwrap();
+
+        assert_eq!(instruction.program_id, Pubkey::default());
+        assert_eq!(instruction.accounts.len(), 1);
+        assert!(instruction.accounts[0].is_signer);
+        assert!(!instruction.accounts[0].is_writable);
+        assert_eq!(instruction.data, vec![1, 2, 3]);
     }
 
     #[test]
-    fn derives_dry_run_execution_from_order_quote() {
-        let order = OrderResponse {
-            request_id: Some("req".to_string()),
-            transaction: None,
-            input_mint: Pubkey::new_unique().to_string(),
-            output_mint: Pubkey::new_unique().to_string(),
-            in_amount: Some("4000000".to_string()),
-            out_amount: Some("43210".to_string()),
-            slippage_bps: Some(20),
-            price_impact: Some(0.1),
-            router: Some("aggregator".to_string()),
-            error_code: None,
-            error_message: None,
-        };
+    fn detects_compute_unit_price_instruction() {
+        let price_ix =
+            anchor_client::solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+                25_000,
+            );
 
-        let execution = order.dry_run_execution(4_000_000).unwrap();
-        assert_eq!(execution.input_consumed, 4_000_000);
-        assert_eq!(execution.output_received, 43_210);
-        assert_eq!(execution.signature, None);
+        assert!(has_compute_unit_price(&[price_ix]));
+    }
+
+    #[test]
+    fn removes_compute_unit_limit_instruction() {
+        let limit_ix =
+            anchor_client::solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                300_000,
+            );
+        let price_ix =
+            anchor_client::solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+                25_000,
+            );
+
+        let filtered = without_compute_unit_limit(&[limit_ix, price_ix.clone()]);
+
+        assert_eq!(filtered, vec![price_ix]);
     }
 }

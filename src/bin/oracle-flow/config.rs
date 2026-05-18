@@ -7,9 +7,13 @@ use crate::telemetry::TelemetryConfig;
 #[derive(Clone, Debug)]
 pub struct JupiterConfig {
     pub api_key: Option<String>,
-    pub ultra_api_base_url: String,
+    pub swap_api_base_url: String,
     pub max_slippage_bps: u64,
     pub max_price_impact_bps: u64,
+    pub compute_unit_price_percentile: String,
+    pub fallback_compute_unit_price_micro_lamports: u64,
+    pub max_accounts: u64,
+    pub swap_mode: Option<String>,
     pub dry_run: bool,
 }
 
@@ -27,7 +31,6 @@ pub struct Config {
     pub quote_threshold_bps: u64,
     pub flow_reduction_factor: f64,
     pub max_flow_reduction_attempts: usize,
-    pub rebalance_cooldown_secs: u64,
     pub min_rebalance_value_usd: f64,
     pub jupiter: JupiterConfig,
     pub telemetry: TelemetryConfig,
@@ -96,10 +99,6 @@ impl Config {
             .unwrap_or_else(|_| "200".to_string())
             .parse::<usize>()?;
 
-        let rebalance_cooldown_secs = env::var("REBALANCE_COOLDOWN_SECS")
-            .unwrap_or_else(|_| "60".to_string())
-            .parse::<u64>()?;
-
         let min_rebalance_value_usd = env::var("MIN_REBALANCE_VALUE_USD")
             .unwrap_or_else(|_| "1.0".to_string())
             .parse::<f64>()?;
@@ -110,14 +109,28 @@ impl Config {
             api_key: env::var("JUPITER_API_KEY")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            ultra_api_base_url: env::var("JUPITER_ULTRA_API_BASE_URL")
-                .unwrap_or_else(|_| "https://api.jup.ag/ultra/v1".to_string()),
+            swap_api_base_url: env::var("JUPITER_SWAP_API_BASE_URL")
+                .or_else(|_| env::var("JUPITER_API_BASE_URL"))
+                .unwrap_or_else(|_| "https://api.jup.ag/swap/v2".to_string()),
             max_slippage_bps: env::var("JUPITER_MAX_SLIPPAGE_BPS")
                 .unwrap_or_else(|_| "50".to_string())
                 .parse::<u64>()?,
             max_price_impact_bps: env::var("JUPITER_MAX_PRICE_IMPACT_BPS")
                 .unwrap_or_else(|_| "50".to_string())
                 .parse::<u64>()?,
+            compute_unit_price_percentile: env::var("JUPITER_COMPUTE_UNIT_PRICE_PERCENTILE")
+                .unwrap_or_else(|_| "high".to_string()),
+            fallback_compute_unit_price_micro_lamports: env::var(
+                "JUPITER_FALLBACK_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS",
+            )
+            .unwrap_or_else(|_| "25000".to_string())
+            .parse::<u64>()?,
+            max_accounts: env::var("JUPITER_MAX_ACCOUNTS")
+                .unwrap_or_else(|_| "48".to_string())
+                .parse::<u64>()?,
+            swap_mode: env::var("JUPITER_SWAP_MODE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             dry_run: env::var("JUPITER_DRY_RUN")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse::<bool>()?,
@@ -137,7 +150,6 @@ impl Config {
             quote_threshold_bps,
             flow_reduction_factor,
             max_flow_reduction_attempts,
-            rebalance_cooldown_secs,
             min_rebalance_value_usd,
             jupiter,
             telemetry,

@@ -29,6 +29,7 @@ pub struct Config {
     pub poll_interval_secs: u64,
     pub rebalance_threshold_bps: u64,
     pub quote_threshold_bps: u64,
+    pub flow_divisor: u64,
     pub flow_reduction_factor: f64,
     pub max_flow_reduction_attempts: usize,
     pub min_rebalance_value_usd: f64,
@@ -91,6 +92,8 @@ impl Config {
             .unwrap_or_else(|_| "50".to_string())
             .parse::<u64>()?;
 
+        let flow_divisor = parse_flow_divisor(env::var("FLOW_DIVISOR").ok())?;
+
         let flow_reduction_factor = env::var("FLOW_REDUCTION_FACTOR")
             .unwrap_or_else(|_| "0.99".to_string())
             .parse::<f64>()?;
@@ -148,6 +151,7 @@ impl Config {
             poll_interval_secs,
             rebalance_threshold_bps,
             quote_threshold_bps,
+            flow_divisor,
             flow_reduction_factor,
             max_flow_reduction_attempts,
             min_rebalance_value_usd,
@@ -158,5 +162,34 @@ impl Config {
 
     pub fn cluster(&self) -> Cluster {
         Cluster::Custom(self.rpc_url.clone(), self.ws_url.clone())
+    }
+}
+
+fn parse_flow_divisor(raw: Option<String>) -> anyhow::Result<u64> {
+    let flow_divisor = raw.unwrap_or_else(|| "5".to_string()).parse::<u64>()?;
+    if flow_divisor == 0 {
+        anyhow::bail!("FLOW_DIVISOR must be greater than 0");
+    }
+
+    Ok(flow_divisor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_divisor_defaults_to_five() {
+        assert_eq!(parse_flow_divisor(None).unwrap(), 5);
+    }
+
+    #[test]
+    fn flow_divisor_accepts_env_override() {
+        assert_eq!(parse_flow_divisor(Some("8".to_string())).unwrap(), 8);
+    }
+
+    #[test]
+    fn flow_divisor_rejects_zero() {
+        assert!(parse_flow_divisor(Some("0".to_string())).is_err());
     }
 }

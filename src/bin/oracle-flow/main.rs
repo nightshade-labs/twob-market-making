@@ -16,7 +16,7 @@ use anchor_client::{
 };
 use config::{Config, JupiterConfig};
 use price::fetch_price;
-use quote::{calculate_optimal_quote, should_update_quote};
+use quote::{QuoteCalculationConfig, calculate_optimal_quote, should_update_quote};
 use rebalance::{RebalanceOutcome, execute_rebalance, needs_rebalance};
 use tokio::{signal, time::sleep};
 use tracing::{Instrument, error, info, info_span, warn};
@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let base_token_decimals = config.base_token_decimals;
     let quote_token_decimals = config.quote_token_decimals;
     let optimal_quote_weight = config.optimal_quote_weight;
+    let flow_divisor = config.flow_divisor;
     let flow_reduction_factor = config.flow_reduction_factor;
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
     let min_rebalance_value_usd = config.min_rebalance_value_usd;
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         rebalance.threshold_bps = rebalance_threshold_bps,
         quote.threshold_bps = quote_threshold_bps,
         quote.optimal_weight = optimal_quote_weight,
+        quote.flow_divisor = flow_divisor,
         jupiter.api_key_configured = jupiter_config.api_key.is_some(),
         jupiter.dry_run = jupiter_config.dry_run,
         jupiter.swap_api_base_url = %jupiter_config.swap_api_base_url,
@@ -116,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
                     base_token_decimals,
                     quote_token_decimals,
                     optimal_quote_weight,
+                    flow_divisor,
                     flow_reduction_factor,
                     max_flow_reduction_attempts,
                     min_rebalance_value_usd,
@@ -156,6 +159,7 @@ async fn run_update_cycle(
     base_token_decimals: u8,
     quote_token_decimals: u8,
     optimal_quote_weight: f64,
+    flow_divisor: u64,
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
     min_rebalance_value_usd: f64,
@@ -394,9 +398,12 @@ async fn run_update_cycle(
             &position,
             &market_state,
             &balances,
-            base_token_decimals,
-            quote_token_decimals,
-            optimal_quote_weight,
+            QuoteCalculationConfig {
+                base_token_decimals,
+                quote_token_decimals,
+                weight: optimal_quote_weight,
+                flow_divisor,
+            },
         )
     };
 

@@ -12,15 +12,21 @@ pub struct OptimalQuote {
     pub quote_flow: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct QuoteCalculationConfig {
+    pub base_token_decimals: u8,
+    pub quote_token_decimals: u8,
+    pub weight: f64,
+    pub flow_divisor: u64,
+}
+
 /// Calculate the optimal quote based on oracle price and inventory-implied price.
 pub fn calculate_optimal_quote(
     price: &PriceData,
     position: &LiquidityPosition,
     market_state: &MarketState,
     balances: &LiquidityPositionBalances,
-    base_token_decimals: u8,
-    quote_token_decimals: u8,
-    weight: f64,
+    config: QuoteCalculationConfig,
 ) -> OptimalQuote {
     let fallback = OptimalQuote {
         base_flow: position.base_flow_u64.max(1),
@@ -37,9 +43,11 @@ pub fn calculate_optimal_quote(
         return fallback;
     }
 
-    let Some(inventory_price) =
-        liquidity_position_price(balances, base_token_decimals, quote_token_decimals)
-    else {
+    let Some(inventory_price) = liquidity_position_price(
+        balances,
+        config.base_token_decimals,
+        config.quote_token_decimals,
+    ) else {
         warn!(
             event.name = "quote_compute_fallback",
             quote.reason = "liquidity_position_price_unavailable",
@@ -52,21 +60,21 @@ pub fn calculate_optimal_quote(
     let _market_price = market_price_excluding_position(
         position,
         market_state,
-        base_token_decimals,
-        quote_token_decimals,
+        config.base_token_decimals,
+        config.quote_token_decimals,
     );
 
-    let normalized_weight = sanitize_weight(weight);
+    let normalized_weight = sanitize_weight(config.weight);
     // Weighted blend between oracle and inventory-implied price.
     let target_quote_price =
         (oracle_price + normalized_weight * inventory_price) / (1.0 + normalized_weight);
 
-    let Some(target_flows) = compute_target_flows(
+    let Some(unscaled_target_flows) = compute_target_flows(
         balances,
         target_quote_price,
         inventory_price,
-        base_token_decimals,
-        quote_token_decimals,
+        config.base_token_decimals,
+        config.quote_token_decimals,
     ) else {
         warn!(
             event.name = "quote_compute_fallback",
@@ -77,6 +85,7 @@ pub fn calculate_optimal_quote(
         );
         return fallback;
     };
+    let target_flows = divide_flows(unscaled_target_flows, config.flow_divisor);
 
     info!(
         event.name = "quote_computed",
@@ -84,6 +93,7 @@ pub fn calculate_optimal_quote(
         price.inventory = inventory_price,
         quote.weight = normalized_weight,
         quote.target_price = target_quote_price,
+        quote.flow_divisor = config.flow_divisor,
         quote.target_base_flow = target_flows.base_flow,
         quote.target_quote_flow = target_flows.quote_flow,
         quote.previous_base_flow = position.base_flow_u64,
@@ -91,6 +101,15 @@ pub fn calculate_optimal_quote(
     );
 
     target_flows
+}
+
+fn divide_flows(flows: OptimalQuote, flow_divisor: u64) -> OptimalQuote {
+    let divisor = flow_divisor.max(1);
+
+    OptimalQuote {
+        base_flow: (flows.base_flow / divisor).max(1),
+        quote_flow: (flows.quote_flow / divisor).max(1),
+    }
 }
 
 /// Check if the current quote deviates from optimal by more than the threshold.
@@ -358,6 +377,34 @@ mod tests {
         let optimal = compute_target_flows(&balances, 99.0, 100.0, 9, 6).unwrap();
         assert_eq!(optimal.base_flow, 1_000_000_000);
         assert_eq!(optimal.quote_flow, 99_000_000);
+    }
+
+    #[test]
+    fn divides_target_flows_after_price_calculation() {
+        let divided = divide_flows(
+            OptimalQuote {
+                base_flow: 1_000_000_000,
+                quote_flow: 100_000_000,
+            },
+            5,
+        );
+
+        assert_eq!(divided.base_flow, 200_000_000);
+        assert_eq!(divided.quote_flow, 20_000_000);
+    }
+
+    #[test]
+    fn divided_flows_keep_minimum_live_flow() {
+        let divided = divide_flows(
+            OptimalQuote {
+                base_flow: 4,
+                quote_flow: 3,
+            },
+            5,
+        );
+
+        assert_eq!(divided.base_flow, 1);
+        assert_eq!(divided.quote_flow, 1);
     }
 
     #[test]

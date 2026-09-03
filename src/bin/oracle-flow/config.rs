@@ -29,6 +29,9 @@ pub struct Config {
     pub poll_interval_secs: u64,
     pub rebalance_threshold_bps: u64,
     pub quote_threshold_bps: u64,
+    pub max_quote_price_deviation_bps: u64,
+    pub max_oracle_age_secs: u64,
+    pub max_oracle_future_skew_secs: u64,
     pub flow_divisor: u64,
     pub flow_reduction_factor: f64,
     pub max_flow_reduction_attempts: usize,
@@ -92,15 +95,36 @@ impl Config {
             .unwrap_or_else(|_| "50".to_string())
             .parse::<u64>()?;
 
+        let max_quote_price_deviation_bps = parse_bps(
+            "MAX_QUOTE_PRICE_DEVIATION_BPS",
+            env::var("MAX_QUOTE_PRICE_DEVIATION_BPS").ok(),
+            100,
+        )?;
+
+        let max_oracle_age_secs = parse_positive_u64(
+            "MAX_ORACLE_AGE_SECS",
+            env::var("MAX_ORACLE_AGE_SECS").ok(),
+            30,
+        )?;
+
+        let max_oracle_future_skew_secs = env::var("MAX_ORACLE_FUTURE_SKEW_SECS")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse::<u64>()?;
+
         let flow_divisor = parse_flow_divisor(env::var("FLOW_DIVISOR").ok())?;
 
-        let flow_reduction_factor = env::var("FLOW_REDUCTION_FACTOR")
-            .unwrap_or_else(|_| "0.99".to_string())
-            .parse::<f64>()?;
+        let flow_reduction_factor = parse_flow_reduction_factor(
+            env::var("FLOW_REDUCTION_FACTOR")
+                .unwrap_or_else(|_| "0.99".to_string())
+                .parse::<f64>()?,
+        )?;
 
-        let max_flow_reduction_attempts = env::var("MAX_FLOW_REDUCTION_ATTEMPTS")
-            .unwrap_or_else(|_| "200".to_string())
-            .parse::<usize>()?;
+        let max_flow_reduction_attempts = parse_positive_usize(
+            "MAX_FLOW_REDUCTION_ATTEMPTS",
+            env::var("MAX_FLOW_REDUCTION_ATTEMPTS")
+                .unwrap_or_else(|_| "200".to_string())
+                .parse::<usize>()?,
+        )?;
 
         let min_rebalance_value_usd = env::var("MIN_REBALANCE_VALUE_USD")
             .unwrap_or_else(|_| "1.0".to_string())
@@ -151,6 +175,9 @@ impl Config {
             poll_interval_secs,
             rebalance_threshold_bps,
             quote_threshold_bps,
+            max_quote_price_deviation_bps,
+            max_oracle_age_secs,
+            max_oracle_future_skew_secs,
             flow_divisor,
             flow_reduction_factor,
             max_flow_reduction_attempts,
@@ -166,12 +193,41 @@ impl Config {
 }
 
 fn parse_flow_divisor(raw: Option<String>) -> anyhow::Result<u64> {
-    let flow_divisor = raw.unwrap_or_else(|| "5".to_string()).parse::<u64>()?;
-    if flow_divisor == 0 {
-        anyhow::bail!("FLOW_DIVISOR must be greater than 0");
+    parse_positive_u64("FLOW_DIVISOR", raw, 5)
+}
+
+fn parse_positive_u64(name: &str, raw: Option<String>, default: u64) -> anyhow::Result<u64> {
+    let value = raw.unwrap_or_else(|| default.to_string()).parse::<u64>()?;
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than 0");
     }
 
-    Ok(flow_divisor)
+    Ok(value)
+}
+
+fn parse_bps(name: &str, raw: Option<String>, default: u64) -> anyhow::Result<u64> {
+    let value = raw.unwrap_or_else(|| default.to_string()).parse::<u64>()?;
+    if value > 10_000 {
+        anyhow::bail!("{name} must not exceed 10000");
+    }
+
+    Ok(value)
+}
+
+fn parse_flow_reduction_factor(value: f64) -> anyhow::Result<f64> {
+    if !value.is_finite() || value <= 0.0 || value >= 1.0 {
+        anyhow::bail!("FLOW_REDUCTION_FACTOR must be finite and between 0 and 1")
+    }
+
+    Ok(value)
+}
+
+fn parse_positive_usize(name: &str, value: usize) -> anyhow::Result<usize> {
+    if value == 0 {
+        anyhow::bail!("{name} must be greater than 0")
+    }
+
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -191,5 +247,28 @@ mod tests {
     #[test]
     fn flow_divisor_rejects_zero() {
         assert!(parse_flow_divisor(Some("0".to_string())).is_err());
+    }
+
+    #[test]
+    fn quote_price_deviation_rejects_more_than_one_hundred_percent() {
+        assert!(parse_bps("TEST_BPS", Some("10001".to_string()), 100).is_err());
+    }
+
+    #[test]
+    fn positive_values_reject_zero() {
+        assert!(parse_positive_u64("TEST_VALUE", Some("0".to_string()), 1).is_err());
+    }
+
+    #[test]
+    fn flow_reduction_factor_must_reduce() {
+        for invalid in [f64::NAN, f64::INFINITY, 0.0, 1.0, 1.1] {
+            assert!(parse_flow_reduction_factor(invalid).is_err());
+        }
+        assert_eq!(parse_flow_reduction_factor(0.95).unwrap(), 0.95);
+    }
+
+    #[test]
+    fn reduction_attempts_must_be_positive() {
+        assert!(parse_positive_usize("TEST_ATTEMPTS", 0).is_err());
     }
 }

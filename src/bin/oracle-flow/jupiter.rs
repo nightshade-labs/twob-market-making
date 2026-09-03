@@ -112,7 +112,13 @@ impl<'a> JupiterSwapClient<'a> {
             )
             .await?;
 
-        build.validate(input_mint, output_mint, amount, self.config)?;
+        build.validate(
+            input_mint,
+            output_mint,
+            amount,
+            liquidity_provider.pubkey(),
+            self.config,
+        )?;
         let built_swap = build.into_built_swap()?;
 
         info!(
@@ -212,6 +218,7 @@ impl BuildResponse {
         input_mint: Pubkey,
         output_mint: Pubkey,
         amount: u64,
+        expected_signer: Pubkey,
         config: &JupiterConfig,
     ) -> anyhow::Result<()> {
         ensure!(
@@ -242,19 +249,47 @@ impl BuildResponse {
             config.max_slippage_bps
         );
 
-        if let Some(price_impact_bps) = self.price_impact_bps() {
-            ensure!(
-                price_impact_bps <= config.max_price_impact_bps as f64,
-                "Jupiter price impact too high: {} bps > {} bps",
-                price_impact_bps,
-                config.max_price_impact_bps
-            );
+        let price_impact_bps = self
+            .price_impact_bps()?
+            .context("Jupiter build response is missing priceImpactPct")?;
+        ensure!(
+            price_impact_bps <= config.max_price_impact_bps as f64,
+            "Jupiter price impact too high: {} bps > {} bps",
+            price_impact_bps,
+            config.max_price_impact_bps
+        );
+        self.validate_instruction_signers(expected_signer)?;
+
+        Ok(())
+    }
+
+    fn validate_instruction_signers(&self, expected_signer: Pubkey) -> anyhow::Result<()> {
+        let instructions = self
+            .compute_budget_instructions
+            .iter()
+            .chain(&self.setup_instructions)
+            .chain(std::iter::once(&self.swap_instruction))
+            .chain(self.cleanup_instruction.iter())
+            .chain(&self.other_instructions)
+            .chain(self.tip_instruction.iter());
+
+        for instruction in instructions {
+            for account in &instruction.accounts {
+                if account.is_signer {
+                    ensure!(
+                        account.pubkey == expected_signer.to_string(),
+                        "Jupiter instruction requested unexpected signer {}",
+                        account.pubkey
+                    );
+                }
+            }
         }
 
         Ok(())
     }
 
     fn into_built_swap(self) -> anyhow::Result<BuiltSwap> {
+        let price_impact_bps = self.price_impact_bps()?;
         let input_amount = self
             .in_amount
             .parse::<u64>()
@@ -278,7 +313,7 @@ impl BuildResponse {
             expected_output,
             minimum_output,
             slippage_bps: self.slippage_bps,
-            price_impact_bps: self.price_impact_bps(),
+            price_impact_bps,
             route_labels: self.route_labels(),
             compute_budget_instructions: decode_instructions(self.compute_budget_instructions)?,
             setup_instructions: decode_instructions(self.setup_instructions)?,
@@ -296,10 +331,11 @@ impl BuildResponse {
         })
     }
 
-    fn price_impact_bps(&self) -> Option<f64> {
+    fn price_impact_bps(&self) -> anyhow::Result<Option<f64>> {
         self.price_impact_pct
             .as_ref()
-            .map(|impact| impact.value() * 10_000.0)
+            .map(|impact| impact.value().map(|value| value * 10_000.0))
+            .transpose()
     }
 
     fn route_labels(&self) -> Vec<String> {
@@ -361,11 +397,18 @@ enum NumericString {
 }
 
 impl NumericString {
-    fn value(&self) -> f64 {
-        match self {
-            Self::String(value) => value.parse::<f64>().unwrap_or(0.0),
+    fn value(&self) -> anyhow::Result<f64> {
+        let value = match self {
+            Self::String(value) => value
+                .parse::<f64>()
+                .context("Invalid Jupiter priceImpactPct")?,
             Self::Number(value) => *value,
-        }
+        };
+        ensure!(
+            value.is_finite() && value >= 0.0,
+            "Jupiter priceImpactPct must be finite and non-negative"
+        );
+        Ok(value)
     }
 }
 
@@ -527,5 +570,12 @@ mod tests {
         let filtered = without_compute_unit_limit(&[limit_ix, price_ix.clone()]);
 
         assert_eq!(filtered, vec![price_ix]);
+    }
+
+    #[test]
+    fn invalid_price_impact_fails_closed() {
+        for value in ["not-a-number", "NaN", "inf", "-0.01"] {
+            assert!(NumericString::String(value.to_string()).value().is_err());
+        }
     }
 }

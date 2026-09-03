@@ -48,7 +48,7 @@ pub async fn evaluate_position(
         market_state.market,
         market_state.current_slot,
     )
-    .await;
+    .await?;
 
     let action = if balances.base_debt > 0 || balances.quote_debt > 0 {
         PositionAction::Stop { reference_index }

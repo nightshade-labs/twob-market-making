@@ -2,12 +2,11 @@ use anyhow::{Context, anyhow};
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct PriceData {
     pub price: f64,
-    #[allow(dead_code)]
     pub timestamp: u64,
 }
 
@@ -23,14 +22,7 @@ pub async fn fetch_price(client: &reqwest::Client, url: &str) -> anyhow::Result<
     let response: PriceResponse = client.get(url).send().await?.json().await?;
 
     let price = parse_price(&response.price)?;
-    let timestamp = parse_timestamp(response.timestamp.as_ref()).unwrap_or_else(|err| {
-        warn!(
-            event.name = "price_timestamp_parse_failed",
-            error = %err,
-            "falling back to current UNIX time"
-        );
-        unix_now()
-    });
+    let timestamp = parse_timestamp(response.timestamp.as_ref())?;
 
     Ok(PriceData { price, timestamp })
 }
@@ -51,9 +43,7 @@ fn parse_price(raw: &Value) -> anyhow::Result<f64> {
 }
 
 fn parse_timestamp(raw: Option<&Value>) -> anyhow::Result<u64> {
-    let Some(value) = raw else {
-        return Ok(unix_now());
-    };
+    let value = raw.context("price response is missing timestamp")?;
 
     match value {
         Value::Number(n) => n
@@ -77,13 +67,6 @@ fn parse_timestamp(raw: Option<&Value>) -> anyhow::Result<u64> {
             json_type(value)
         )),
     }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn json_type(value: &Value) -> &'static str {
@@ -137,5 +120,13 @@ mod tests {
 
         assert_eq!(price, 42.5);
         assert_eq!(timestamp, 1_771_255_481);
+    }
+
+    #[test]
+    fn rejects_missing_timestamp() {
+        let payload = json!({ "price": 42.5 });
+        let response: PriceResponse = serde_json::from_value(payload).unwrap();
+
+        assert!(parse_timestamp(response.timestamp.as_ref()).is_err());
     }
 }

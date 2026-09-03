@@ -18,6 +18,7 @@ pub struct QuoteCalculationConfig {
     pub quote_token_decimals: u8,
     pub weight: f64,
     pub flow_divisor: u64,
+    pub max_price_deviation_bps: u64,
 }
 
 /// Calculate the optimal quote based on oracle price and inventory-implied price.
@@ -66,8 +67,13 @@ pub fn calculate_optimal_quote(
 
     let normalized_weight = sanitize_weight(config.weight);
     // Weighted blend between oracle and inventory-implied price.
-    let target_quote_price =
+    let unbounded_target_quote_price =
         (oracle_price + normalized_weight * inventory_price) / (1.0 + normalized_weight);
+    let target_quote_price = clamp_price_to_oracle(
+        oracle_price,
+        unbounded_target_quote_price,
+        config.max_price_deviation_bps,
+    );
 
     let Some(unscaled_target_flows) = compute_target_flows(
         balances,
@@ -92,7 +98,9 @@ pub fn calculate_optimal_quote(
         price.oracle = oracle_price,
         price.inventory = inventory_price,
         quote.weight = normalized_weight,
+        quote.unbounded_target_price = unbounded_target_quote_price,
         quote.target_price = target_quote_price,
+        quote.max_price_deviation_bps = config.max_price_deviation_bps,
         quote.flow_divisor = config.flow_divisor,
         quote.target_base_flow = target_flows.base_flow,
         quote.target_quote_flow = target_flows.quote_flow,
@@ -141,6 +149,14 @@ fn sanitize_weight(weight: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn clamp_price_to_oracle(oracle_price: f64, target_price: f64, max_deviation_bps: u64) -> f64 {
+    let deviation_fraction = max_deviation_bps.min(10_000) as f64 / 10_000.0;
+    let minimum_price = oracle_price * (1.0 - deviation_fraction);
+    let maximum_price = oracle_price * (1.0 + deviation_fraction);
+
+    target_price.clamp(minimum_price, maximum_price)
 }
 
 fn flow_deviation_bps(current: u64, target: u64) -> u128 {
@@ -322,6 +338,20 @@ mod tests {
 
         let blended = (oracle + weight * lp) / (1.0 + weight);
         assert!((blended - 98.1818181818).abs() < 1e-9);
+    }
+
+    #[test]
+    fn target_price_is_clamped_to_oracle_band() {
+        let oracle = 97.66;
+
+        let clamped = clamp_price_to_oracle(oracle, 118.05, 100);
+
+        assert!((clamped - 98.6366).abs() < 1e-9);
+    }
+
+    #[test]
+    fn target_price_inside_oracle_band_is_unchanged() {
+        assert_eq!(clamp_price_to_oracle(100.0, 100.5, 100), 100.5);
     }
 
     #[test]

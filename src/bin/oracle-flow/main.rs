@@ -2,6 +2,7 @@ mod config;
 mod jupiter;
 mod price;
 mod quote;
+mod quote_guard;
 mod rebalance;
 mod telemetry;
 
@@ -14,22 +15,30 @@ use anchor_client::{
     Client,
     solana_sdk::{commitment_config::CommitmentConfig, signer::Signer},
 };
+use anyhow::{Context, ensure};
 use config::{Config, JupiterConfig};
-use price::fetch_price;
+use price::{PriceData, fetch_price};
 use quote::{QuoteCalculationConfig, calculate_optimal_quote, should_update_quote};
+use quote_guard::{validate_oracle_freshness, validate_quote};
 use rebalance::{RebalanceOutcome, execute_rebalance, needs_rebalance};
 use tokio::{signal, time::sleep};
 use tracing::{Instrument, error, info, info_span, warn};
 use twob_market_making::{
     ARRAY_LENGTH, LiquidityPositionBalances, MarketState, build_update_liquidity_flows_instruction,
-    execute_update_flows, fetch_liquidity_position, fetch_market_state,
-    get_liquidity_position_balances,
+    execute_update_flows, fetch_market_position_state, get_liquidity_position_balances,
     twob_anchor::{self, accounts::LiquidityPosition},
 };
 
-const LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE: u32 = 6013;
+const LIQUIDITY_POSITION_UNHEALTHY_ERROR_CODE: u32 = 6014;
 const BALANCED_QUOTE_VALUE_WEIGHT: f64 = 0.5;
 type OracleProgram = anchor_client::Program<Arc<anchor_client::solana_sdk::signature::Keypair>>;
+
+#[derive(Clone, Copy)]
+struct QuoteSafetyConfig {
+    max_price_deviation_bps: u64,
+    max_oracle_age_secs: u64,
+    max_oracle_future_skew_secs: u64,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -47,6 +56,11 @@ async fn main() -> anyhow::Result<()> {
     let base_token_decimals = config.base_token_decimals;
     let quote_token_decimals = config.quote_token_decimals;
     let optimal_quote_weight = config.optimal_quote_weight;
+    let quote_safety = QuoteSafetyConfig {
+        max_price_deviation_bps: config.max_quote_price_deviation_bps,
+        max_oracle_age_secs: config.max_oracle_age_secs,
+        max_oracle_future_skew_secs: config.max_oracle_future_skew_secs,
+    };
     let flow_divisor = config.flow_divisor;
     let flow_reduction_factor = config.flow_reduction_factor;
     let max_flow_reduction_attempts = config.max_flow_reduction_attempts;
@@ -81,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         rebalance.threshold_bps = rebalance_threshold_bps,
         quote.threshold_bps = quote_threshold_bps,
         quote.optimal_weight = optimal_quote_weight,
+        quote.max_price_deviation_bps = quote_safety.max_price_deviation_bps,
+        oracle.max_age_secs = quote_safety.max_oracle_age_secs,
+        oracle.max_future_skew_secs = quote_safety.max_oracle_future_skew_secs,
         quote.flow_divisor = flow_divisor,
         jupiter.api_key_configured = jupiter_config.api_key.is_some(),
         jupiter.dry_run = jupiter_config.dry_run,
@@ -118,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
                     base_token_decimals,
                     quote_token_decimals,
                     optimal_quote_weight,
+                    quote_safety,
                     flow_divisor,
                     flow_reduction_factor,
                     max_flow_reduction_attempts,
@@ -159,6 +177,7 @@ async fn run_update_cycle(
     base_token_decimals: u8,
     quote_token_decimals: u8,
     optimal_quote_weight: f64,
+    quote_safety: QuoteSafetyConfig,
     flow_divisor: u64,
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
@@ -188,11 +207,20 @@ async fn run_update_cycle(
             price.feed_url = %price_feed_url,
         ))
         .await?;
+    validate_oracle_freshness(
+        price_data.price,
+        price_data.timestamp,
+        current_unix_timestamp()?,
+        quote_safety.max_oracle_age_secs,
+        quote_safety.max_oracle_future_skew_secs,
+    )
+    .context("oracle price failed freshness validation")?;
     info!(
         event.name = "price_fetched",
         cycle.id = %cycle_id,
         market.id = market_id,
         price.oracle = price_data.price,
+        price.timestamp = price_data.timestamp,
     );
 
     // 2. Fetch liquidity position and market state
@@ -263,9 +291,10 @@ async fn run_update_cycle(
             position.quote_flow_u64,
             liquidity_provider.clone(),
             jupiter_config,
-            flow_reduction_factor,
-            max_flow_reduction_attempts,
             min_rebalance_value_usd,
+            quote_safety.max_price_deviation_bps,
+            quote_safety.max_oracle_age_secs,
+            quote_safety.max_oracle_future_skew_secs,
             is_devnet,
             cycle_id,
             &attempt_id,
@@ -318,6 +347,24 @@ async fn run_update_cycle(
                     rebalance.outcome = "executed",
                     histogram.rebalance_duration_ms = attempt_started_at.elapsed().as_millis() as f64,
                 );
+
+                if needs_rebalance(
+                    &price_data,
+                    &balances,
+                    base_token_decimals,
+                    quote_token_decimals,
+                    rebalance_threshold_bps,
+                ) {
+                    error!(
+                        event.name = "rebalance_postcondition_failed",
+                        cycle.id = %cycle_id,
+                        market.id = market_id,
+                        lp.authority = %authority,
+                        rebalance.attempt_id = %attempt_id,
+                        "position remains outside the rebalance threshold; holding current quote"
+                    );
+                    return Ok(());
+                }
             }
             Ok(RebalanceOutcome::Skipped) => {
                 info!(
@@ -330,6 +377,7 @@ async fn run_update_cycle(
                     monotonic_counter.rebalance_skips_total = 1_u64,
                     histogram.rebalance_duration_ms = attempt_started_at.elapsed().as_millis() as f64,
                 );
+                return Ok(());
             }
             Err(error) => {
                 error!(
@@ -341,36 +389,9 @@ async fn run_update_cycle(
                     rebalance.outcome = "error",
                     histogram.rebalance_duration_ms = attempt_started_at.elapsed().as_millis() as f64,
                     ?error,
-                    "atomic rebalance failed; no liquidity should have moved"
+                    "rebalance did not complete; holding current quote"
                 );
-                match refresh_position_state(program, market_id, authority)
-                    .instrument(info_span!(
-                        "state.refresh",
-                        cycle.id = %cycle_id,
-                        market.id = market_id,
-                        lp.authority = %authority,
-                        rebalance.attempt_id = %attempt_id,
-                    ))
-                    .await
-                {
-                    Ok((new_market_state, new_position, new_balances)) => {
-                        market_state = new_market_state;
-                        position = new_position;
-                        balances = new_balances;
-                    }
-                    Err(error) => {
-                        error!(
-                            event.name = "rebalance_failure_refresh_failed",
-                            cycle.id = %cycle_id,
-                            market.id = market_id,
-                            lp.authority = %authority,
-                            rebalance.attempt_id = %attempt_id,
-                            ?error,
-                            "refresh after rebalance failure failed; skipping quote update"
-                        );
-                        return Ok(());
-                    }
-                }
+                return Ok(());
             }
         }
     } else {
@@ -403,21 +424,47 @@ async fn run_update_cycle(
                 quote_token_decimals,
                 weight: optimal_quote_weight,
                 flow_divisor,
+                max_price_deviation_bps: quote_safety.max_price_deviation_bps,
             },
         )
     };
 
-    // 4. Get current quote from position
+    // 5. Get current quote from position
     let current_base_flow = position.base_flow_u64;
     let current_quote_flow = position.quote_flow_u64;
-
-    // 5. Check if update is needed
-    if should_update_quote(
+    let current_quote_safe = match validate_candidate_quote(
         current_base_flow,
         current_quote_flow,
-        &optimal,
-        quote_threshold_bps,
+        base_token_decimals,
+        quote_token_decimals,
+        &price_data,
+        quote_safety,
     ) {
+        Ok(()) => true,
+        Err(error) => {
+            error!(
+                event.name = "current_quote_safety_violation",
+                cycle.id = %cycle_id,
+                market.id = market_id,
+                lp.authority = %authority,
+                quote.current_base_flow = current_base_flow,
+                quote.current_quote_flow = current_quote_flow,
+                ?error,
+                "current quote is outside the oracle safety envelope"
+            );
+            false
+        }
+    };
+
+    // 6. Check if update is needed
+    if !current_quote_safe
+        || should_update_quote(
+            current_base_flow,
+            current_quote_flow,
+            &optimal,
+            quote_threshold_bps,
+        )
+    {
         info!(
             event.name = "flow_update_planned",
             cycle.id = %cycle_id,
@@ -443,6 +490,10 @@ async fn run_update_cycle(
             flow_reduction_factor,
             max_flow_reduction_attempts,
             liquidity_provider,
+            &price_data,
+            base_token_decimals,
+            quote_token_decimals,
+            quote_safety,
         )
         .instrument(info_span!(
             "twob.update_flows",
@@ -505,8 +556,8 @@ async fn refresh_position_state(
     market_id: u64,
     authority: &anchor_client::solana_sdk::pubkey::Pubkey,
 ) -> anyhow::Result<(MarketState, LiquidityPosition, LiquidityPositionBalances)> {
-    let market_state = fetch_market_state(program, market_id).await?;
-    let position = fetch_liquidity_position(program, market_id, authority).await?;
+    let (market_state, position) =
+        fetch_market_position_state(program, market_id, authority).await?;
     let balances = get_liquidity_position_balances(
         program,
         position,
@@ -514,9 +565,47 @@ async fn refresh_position_state(
         market_state.market,
         market_state.current_slot,
     )
-    .await;
+    .await?;
+    let (validation_market_state, validation_position) =
+        fetch_market_position_state(program, market_id, authority).await?;
+    ensure!(
+        snapshot_inputs_match(
+            &market_state,
+            &position,
+            &validation_market_state,
+            &validation_position,
+        ),
+        "market or position changed while reconstructing balances"
+    );
 
     Ok((market_state, position, balances))
+}
+
+fn snapshot_inputs_match(
+    first_market: &MarketState,
+    first_position: &LiquidityPosition,
+    second_market: &MarketState,
+    second_position: &LiquidityPosition,
+) -> bool {
+    first_market.market.base_flow == second_market.market.base_flow
+        && first_market.market.quote_flow == second_market.market.quote_flow
+        && first_market.market.end_slot_interval == second_market.market.end_slot_interval
+        && first_market.bookkeeping.last_update_slot == second_market.bookkeeping.last_update_slot
+        && first_market.bookkeeping.base_per_quote == second_market.bookkeeping.base_per_quote
+        && first_market.bookkeeping.quote_per_base == second_market.bookkeeping.quote_per_base
+        && first_market.bookkeeping.slots_without_trade
+            == second_market.bookkeeping.slots_without_trade
+        && first_position.last_update_slot == second_position.last_update_slot
+        && first_position.slots_without_trade_snapshot
+            == second_position.slots_without_trade_snapshot
+        && first_position.base_per_quote_snapshot == second_position.base_per_quote_snapshot
+        && first_position.quote_per_base_snapshot == second_position.quote_per_base_snapshot
+        && first_position.base_balance == second_position.base_balance
+        && first_position.quote_balance == second_position.quote_balance
+        && first_position.base_debt == second_position.base_debt
+        && first_position.quote_debt == second_position.quote_debt
+        && first_position.base_flow_u64 == second_position.base_flow_u64
+        && first_position.quote_flow_u64 == second_position.quote_flow_u64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -579,11 +668,25 @@ async fn execute_update_flows_with_backoff(
     flow_reduction_factor: f64,
     max_flow_reduction_attempts: usize,
     signer: Arc<anchor_client::solana_sdk::signature::Keypair>,
+    price_data: &PriceData,
+    base_token_decimals: u8,
+    quote_token_decimals: u8,
+    quote_safety: QuoteSafetyConfig,
 ) -> anyhow::Result<(u64, u64)> {
-    let mut candidate_base_flow = base_flow.max(1);
-    let mut candidate_quote_flow = quote_flow.max(1);
+    let original_base_flow = base_flow.max(1);
+    let original_quote_flow = quote_flow.max(1);
+    let mut candidate_base_flow = original_base_flow;
+    let mut candidate_quote_flow = original_quote_flow;
 
     for attempt in 0..max_flow_reduction_attempts {
+        validate_candidate_quote(
+            candidate_base_flow,
+            candidate_quote_flow,
+            base_token_decimals,
+            quote_token_decimals,
+            price_data,
+            quote_safety,
+        )?;
         let ix = build_update_liquidity_flows_instruction(
             program,
             market_id,
@@ -603,6 +706,14 @@ async fn execute_update_flows_with_backoff(
 
         let simulation = program.rpc().simulate_transaction(&signed_tx).await?;
         if simulation.value.err.is_none() {
+            validate_candidate_quote(
+                candidate_base_flow,
+                candidate_quote_flow,
+                base_token_decimals,
+                quote_token_decimals,
+                price_data,
+                quote_safety,
+            )?;
             execute_update_flows(
                 program,
                 market_id,
@@ -633,8 +744,13 @@ async fn execute_update_flows_with_backoff(
         }
 
         if is_liquidity_position_unhealthy(err, logs) {
-            let next_base_flow = reduce_flow(candidate_base_flow, flow_reduction_factor);
-            let next_quote_flow = reduce_flow(candidate_quote_flow, flow_reduction_factor);
+            let (next_base_flow, next_quote_flow) = reduce_flow_pair(
+                original_base_flow,
+                original_quote_flow,
+                candidate_base_flow,
+                candidate_quote_flow,
+                flow_reduction_factor,
+            );
 
             warn!(
                 event.name = "flow_update_flow_reduced",
@@ -705,10 +821,38 @@ fn is_liquidity_position_unhealthy(
         entries.iter().any(|line| {
             line.contains("LiquidityPositionUnhealthy")
                 || line.contains("Liquidity position is unhealthy")
-                || line.contains("custom program error: 0x177d")
+                || line.contains("custom program error: 0x177e")
         })
     })
     .unwrap_or(false)
+}
+
+fn validate_candidate_quote(
+    base_flow: u64,
+    quote_flow: u64,
+    base_token_decimals: u8,
+    quote_token_decimals: u8,
+    price_data: &PriceData,
+    quote_safety: QuoteSafetyConfig,
+) -> anyhow::Result<()> {
+    validate_quote(
+        base_flow,
+        quote_flow,
+        base_token_decimals,
+        quote_token_decimals,
+        price_data.price,
+        price_data.timestamp,
+        current_unix_timestamp()?,
+        quote_safety.max_price_deviation_bps,
+        quote_safety.max_oracle_age_secs,
+        quote_safety.max_oracle_future_skew_secs,
+    )
+    .context("candidate quote failed safety validation")
+}
+
+fn current_unix_timestamp() -> anyhow::Result<u64> {
+    let timestamp = chrono::Utc::now().timestamp();
+    u64::try_from(timestamp).context("system clock is before the Unix epoch")
 }
 
 fn reduce_flow(flow: u64, factor: f64) -> u64 {
@@ -720,6 +864,30 @@ fn reduce_flow(flow: u64, factor: f64) -> u64 {
     reduced.clamp(1, flow - 1)
 }
 
+fn reduce_flow_pair(
+    original_base_flow: u64,
+    original_quote_flow: u64,
+    current_base_flow: u64,
+    current_quote_flow: u64,
+    factor: f64,
+) -> (u64, u64) {
+    if original_base_flow >= original_quote_flow {
+        let next_base_flow = reduce_flow(current_base_flow, factor);
+        let next_quote_flow = scale_flow(original_quote_flow, next_base_flow, original_base_flow);
+        (next_base_flow, next_quote_flow)
+    } else {
+        let next_quote_flow = reduce_flow(current_quote_flow, factor);
+        let next_base_flow = scale_flow(original_base_flow, next_quote_flow, original_quote_flow);
+        (next_base_flow, next_quote_flow)
+    }
+}
+
+fn scale_flow(original_flow: u64, new_anchor_flow: u64, original_anchor_flow: u64) -> u64 {
+    let scaled = u128::from(original_flow) * u128::from(new_anchor_flow)
+        / u128::from(original_anchor_flow.max(1));
+    u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,5 +897,13 @@ mod tests {
         assert_eq!(reduce_flow(100, 0.99), 99);
         assert_eq!(reduce_flow(2, 0.99), 1);
         assert_eq!(reduce_flow(1, 0.99), 1);
+    }
+
+    #[test]
+    fn pair_reduction_scales_both_flows_from_the_original_ratio() {
+        let (base, quote) =
+            reduce_flow_pair(1_000_000_000, 100_000_000, 900_000_000, 90_000_000, 0.5);
+
+        assert_eq!((base, quote), (450_000_000, 45_000_000));
     }
 }

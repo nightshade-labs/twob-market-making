@@ -27,7 +27,8 @@ use tokio::time::sleep;
 use tracing::{Instrument, info, info_span, warn};
 use twob_market_making::{
     ARRAY_LENGTH, AccountResolver, LIQUIDITY_AMPLIFICATION, LiquidityPositionBalances, MarketState,
-    build_add_liquidity_instruction, build_withdraw_liquidity_instruction, get_token_program_id,
+    build_add_liquidity_instruction, build_update_liquidity_flows_instruction,
+    build_withdraw_liquidity_instruction, get_token_program_id,
 };
 
 use crate::{
@@ -37,6 +38,7 @@ use crate::{
         without_compute_unit_limit,
     },
     price::PriceData,
+    quote_guard::validate_quote,
     telemetry,
 };
 
@@ -51,6 +53,12 @@ struct RebalancePlan {
     direction: SwapDirection,
     withdraw_base_lamports: u64,
     withdraw_quote_lamports: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SafeQuote {
+    base_flow: u64,
+    quote_flow: u64,
 }
 
 impl RebalancePlan {
@@ -130,9 +138,10 @@ pub async fn execute_rebalance(
     current_quote_flow: u64,
     liquidity_provider: Arc<Keypair>,
     jupiter_config: &JupiterConfig,
-    _reduction_factor: f64,
-    _max_reduction_attempts: usize,
     min_rebalance_value_usd: f64,
+    max_quote_price_deviation_bps: u64,
+    max_oracle_age_secs: u64,
+    max_oracle_future_skew_secs: u64,
     is_devnet: bool,
     cycle_id: &str,
     attempt_id: &str,
@@ -207,29 +216,29 @@ pub async fn execute_rebalance(
         rebalance.planned_quote_withdraw.raw = uncapped_plan.withdraw_quote_lamports,
         rebalance.planned_input.raw = uncapped_plan.input_amount(),
     );
+    let safe_quote = plan_atomic_safe_quote(
+        price,
+        balances,
+        uncapped_plan,
+        current_base_flow,
+        current_quote_flow,
+        base_token_decimals,
+        quote_token_decimals,
+    )?;
     let Some(plan) = cap_rebalance_to_withdrawable(
         uncapped_plan,
         balances,
-        current_base_flow,
-        current_quote_flow,
+        safe_quote.base_flow,
+        safe_quote.quote_flow,
     ) else {
-        info!(
-            event.name = "rebalance_skipped",
-            cycle.id = %cycle_id,
-            market.id = market_id,
-            lp.authority = %liquidity_provider.pubkey(),
-            rebalance.attempt_id = %attempt_id,
-            rebalance.reason = "no_withdrawable_liquidity",
-            rebalance.outcome = "skipped",
-            position.base_balance.raw = balances.base_balance,
-            position.quote_balance.raw = balances.quote_balance,
-            position.base_flow.raw = current_base_flow,
-            position.quote_flow.raw = current_quote_flow,
-        );
-        return Ok(RebalanceOutcome::Skipped);
+        anyhow::bail!("atomic safe quote left no withdrawable liquidity");
     };
+    ensure!(
+        plan == uncapped_plan,
+        "atomic safe quote could not preserve the planned withdrawal"
+    );
     info!(
-        event.name = "rebalance_capped",
+        event.name = "rebalance_safe_quote_planned",
         cycle.id = %cycle_id,
         market.id = market_id,
         lp.authority = %liquidity_provider.pubkey(),
@@ -238,6 +247,11 @@ pub async fn execute_rebalance(
         rebalance.planned_input.raw = plan.input_amount(),
         rebalance.planned_base_withdraw.raw = plan.withdraw_base_lamports,
         rebalance.planned_quote_withdraw.raw = plan.withdraw_quote_lamports,
+        quote.previous_base_flow = current_base_flow,
+        quote.previous_quote_flow = current_quote_flow,
+        quote.safe_base_flow = safe_quote.base_flow,
+        quote.safe_quote_flow = safe_quote.quote_flow,
+        price.oracle = price.price,
     );
     let (input_mint, output_mint) = match plan.direction {
         SwapDirection::BaseToQuote => (
@@ -320,6 +334,15 @@ pub async fn execute_rebalance(
 
     let reference_index =
         oracle_flow_reference_index(program, market_state.market.end_slot_interval).await?;
+    let safe_quote_ix = build_update_liquidity_flows_instruction(
+        program,
+        market_id,
+        crate::twob_anchor::client::args::UpdateLiquidityFlows {
+            reference_index,
+            base_flow_u64: safe_quote.base_flow,
+            quote_flow_u64: safe_quote.quote_flow,
+        },
+    );
     let withdraw_ix = build_withdraw_liquidity_instruction(
         program,
         market_id,
@@ -375,18 +398,8 @@ pub async fn execute_rebalance(
     .await
     .context("Failed to build add_liquidity instruction for atomic rebalance")?;
 
-    let mut atomic_instructions = Vec::new();
-    atomic_instructions.extend(built_swap.setup_instructions.iter().cloned());
-    atomic_instructions.push(withdraw_ix);
-    atomic_instructions.push(built_swap.swap_instruction.clone());
-    atomic_instructions.push(add_ix);
-    if let Some(cleanup_ix) = &built_swap.cleanup_instruction {
-        atomic_instructions.push(cleanup_ix.clone());
-    }
-    atomic_instructions.extend(built_swap.other_instructions.iter().cloned());
-    if let Some(tip_ix) = &built_swap.tip_instruction {
-        atomic_instructions.push(tip_ix.clone());
-    }
+    let atomic_instructions =
+        compose_atomic_rebalance_body(&built_swap, safe_quote_ix, withdraw_ix, add_ix);
 
     info!(
         event.name = "rebalance_atomic_transaction_planned",
@@ -402,6 +415,8 @@ pub async fn execute_rebalance(
         rebalance.deposit_quote.raw = deposit_quote_lamports,
         rebalance.withdrawn_input.raw = withdraw_amount,
         rebalance.swap_input_requested.raw = built_swap.input_amount,
+        quote.safe_base_flow = safe_quote.base_flow,
+        quote.safe_quote_flow = safe_quote.quote_flow,
         jupiter.expected_output.raw = built_swap.expected_output,
         jupiter.minimum_output.raw = built_swap.minimum_output,
         jupiter.slippage_bps = built_swap.slippage_bps,
@@ -419,6 +434,13 @@ pub async fn execute_rebalance(
         jupiter_config,
         cycle_id,
         attempt_id,
+        safe_quote,
+        price,
+        base_token_decimals,
+        quote_token_decimals,
+        max_quote_price_deviation_bps,
+        max_oracle_age_secs,
+        max_oracle_future_skew_secs,
     )
     .instrument(info_span!(
         "rebalance.atomic_transaction",
@@ -465,6 +487,34 @@ pub async fn execute_rebalance(
     Ok(RebalanceOutcome::Executed)
 }
 
+fn compose_atomic_rebalance_body(
+    built_swap: &BuiltSwap,
+    safe_quote_ix: Instruction,
+    withdraw_ix: Instruction,
+    add_ix: Instruction,
+) -> Vec<Instruction> {
+    let mut instructions = Vec::with_capacity(
+        built_swap.setup_instructions.len()
+            + built_swap.other_instructions.len()
+            + usize::from(built_swap.cleanup_instruction.is_some())
+            + usize::from(built_swap.tip_instruction.is_some())
+            + 4,
+    );
+    instructions.extend(built_swap.setup_instructions.iter().cloned());
+    instructions.push(safe_quote_ix);
+    instructions.push(withdraw_ix);
+    instructions.push(built_swap.swap_instruction.clone());
+    instructions.push(add_ix);
+    if let Some(cleanup_ix) = &built_swap.cleanup_instruction {
+        instructions.push(cleanup_ix.clone());
+    }
+    instructions.extend(built_swap.other_instructions.iter().cloned());
+    if let Some(tip_ix) = &built_swap.tip_instruction {
+        instructions.push(tip_ix.clone());
+    }
+    instructions
+}
+
 #[derive(Debug, Clone)]
 struct AtomicRebalanceExecution {
     signature: Signature,
@@ -481,6 +531,13 @@ async fn execute_atomic_rebalance_transaction(
     jupiter_config: &JupiterConfig,
     cycle_id: &str,
     attempt_id: &str,
+    safe_quote: SafeQuote,
+    price: &PriceData,
+    base_token_decimals: u8,
+    quote_token_decimals: u8,
+    max_quote_price_deviation_bps: u64,
+    max_oracle_age_secs: u64,
+    max_oracle_future_skew_secs: u64,
 ) -> anyhow::Result<AtomicRebalanceExecution> {
     let compute_price_instructions = compute_price_instructions(
         built_swap,
@@ -573,6 +630,21 @@ async fn execute_atomic_rebalance_transaction(
     if jupiter_config.dry_run {
         anyhow::bail!("JUPITER_DRY_RUN=true prevents sending atomic rebalance transactions");
     }
+    let now_timestamp = u64::try_from(chrono::Utc::now().timestamp())
+        .context("system clock is before the Unix epoch")?;
+    validate_quote(
+        safe_quote.base_flow,
+        safe_quote.quote_flow,
+        base_token_decimals,
+        quote_token_decimals,
+        price.price,
+        price.timestamp,
+        now_timestamp,
+        max_quote_price_deviation_bps,
+        max_oracle_age_secs,
+        max_oracle_future_skew_secs,
+    )
+    .context("atomic rebalance quote failed final safety validation")?;
 
     let signature = send_and_confirm_atomic_transaction(
         program,
@@ -591,6 +663,7 @@ async fn execute_atomic_rebalance_transaction(
 }
 
 const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+const MAX_TRANSACTION_SIZE_BYTES: u64 = 1_232;
 const COMPUTE_UNIT_LIMIT_HEADROOM_NUMERATOR: u64 = 12;
 const COMPUTE_UNIT_LIMIT_HEADROOM_DENOMINATOR: u64 = 10;
 const CONFIRM_POLL_DELAY: Duration = Duration::from_millis(400);
@@ -647,8 +720,18 @@ fn build_versioned_transaction(
     )
     .context("Failed to compile atomic rebalance v0 message")?;
     let signers: [&dyn Signer; 1] = [signer];
-    VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
-        .context("Failed to sign atomic rebalance transaction")
+    let transaction = VersionedTransaction::try_new(VersionedMessage::V0(message), &signers)
+        .context("Failed to sign atomic rebalance transaction")?;
+    let transaction_size = bincode::serialized_size(&transaction)
+        .context("Failed to measure atomic rebalance transaction")?;
+    ensure!(
+        transaction_size <= MAX_TRANSACTION_SIZE_BYTES,
+        "Atomic rebalance transaction is too large: {} > {} bytes",
+        transaction_size,
+        MAX_TRANSACTION_SIZE_BYTES,
+    );
+
+    Ok(transaction)
 }
 
 async fn send_and_confirm_atomic_transaction(
@@ -1022,6 +1105,132 @@ fn plan_rebalance(
     None
 }
 
+const ORACLE_PRICE_SCALE: u64 = 1_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OracleFlowRatio {
+    numerator: u128,
+    denominator: u128,
+}
+
+fn oracle_flow_ratio(
+    oracle_price: f64,
+    base_token_decimals: u8,
+    quote_token_decimals: u8,
+) -> anyhow::Result<OracleFlowRatio> {
+    ensure!(
+        oracle_price.is_finite() && oracle_price > 0.0,
+        "atomic safe quote requires a finite positive oracle price"
+    );
+
+    let scaled_price = oracle_price * ORACLE_PRICE_SCALE as f64;
+    ensure!(
+        scaled_price.is_finite() && scaled_price >= 1.0 && scaled_price < u64::MAX as f64,
+        "oracle price cannot be represented at atomic safe quote precision"
+    );
+    let price_atoms = scaled_price.floor() as u64;
+    ensure!(
+        price_atoms > 0,
+        "oracle price rounds to zero at atomic safe quote precision"
+    );
+
+    let base_scale = 10_u128
+        .checked_pow(u32::from(base_token_decimals))
+        .context("base token decimal scale overflowed while planning atomic safe quote")?;
+    let quote_scale = 10_u128
+        .checked_pow(u32::from(quote_token_decimals))
+        .context("quote token decimal scale overflowed while planning atomic safe quote")?;
+    let numerator = u128::from(price_atoms)
+        .checked_mul(quote_scale)
+        .context("oracle flow ratio numerator overflowed")?;
+    let denominator = u128::from(ORACLE_PRICE_SCALE)
+        .checked_mul(base_scale)
+        .context("oracle flow ratio denominator overflowed")?;
+
+    Ok(OracleFlowRatio {
+        numerator,
+        denominator,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_atomic_safe_quote(
+    price: &PriceData,
+    balances: &LiquidityPositionBalances,
+    plan: RebalancePlan,
+    current_base_flow: u64,
+    current_quote_flow: u64,
+    base_token_decimals: u8,
+    quote_token_decimals: u8,
+) -> anyhow::Result<SafeQuote> {
+    ensure!(
+        balances.base_debt == 0 && balances.quote_debt == 0,
+        "atomic safe quote requires a debt-free liquidity position"
+    );
+    ensure!(
+        current_base_flow > 0 && current_quote_flow > 0,
+        "atomic safe quote cannot recover a zero flow side"
+    );
+
+    let remaining_base = balances
+        .base_balance
+        .checked_sub(plan.withdraw_base_lamports)
+        .context("planned base withdrawal exceeds available liquidity")?;
+    let remaining_quote = balances
+        .quote_balance
+        .checked_sub(plan.withdraw_quote_lamports)
+        .context("planned quote withdrawal exceeds available liquidity")?;
+    ensure!(
+        remaining_base > 0 && remaining_quote > 0,
+        "atomic safe quote requires positive inventory on both sides after withdrawal"
+    );
+
+    let max_base_by_inventory = remaining_base
+        .checked_mul(LIQUIDITY_AMPLIFICATION)
+        .context("post-withdraw base flow capacity overflowed")?;
+    let max_quote_by_inventory = remaining_quote
+        .checked_mul(LIQUIDITY_AMPLIFICATION)
+        .context("post-withdraw quote flow capacity overflowed")?;
+    let max_base_flow = current_base_flow.min(max_base_by_inventory);
+    let max_quote_flow = current_quote_flow.min(max_quote_by_inventory);
+    ensure!(
+        max_base_flow > 0 && max_quote_flow > 0,
+        "atomic safe quote has no positive post-withdraw depth"
+    );
+
+    let oracle_ratio = oracle_flow_ratio(price.price, base_token_decimals, quote_token_decimals)?;
+    let max_base_from_quote = u128::from(max_quote_flow)
+        .checked_mul(oracle_ratio.denominator)
+        .context("quote-constrained base flow calculation overflowed")?
+        / oracle_ratio.numerator;
+    let base_flow_u128 = u128::from(max_base_flow).min(max_base_from_quote);
+    ensure!(
+        base_flow_u128 > 0 && base_flow_u128 <= u128::from(u64::MAX),
+        "atomic safe base flow is not representable"
+    );
+    let quote_flow_u128 = base_flow_u128
+        .checked_mul(oracle_ratio.numerator)
+        .context("atomic safe quote flow calculation overflowed")?
+        / oracle_ratio.denominator;
+    ensure!(
+        quote_flow_u128 > 0
+            && quote_flow_u128 <= u128::from(max_quote_flow)
+            && quote_flow_u128 <= u128::from(u64::MAX),
+        "atomic safe quote flow is not representable"
+    );
+
+    let safe_quote = SafeQuote {
+        base_flow: base_flow_u128 as u64,
+        quote_flow: quote_flow_u128 as u64,
+    };
+    ensure!(
+        safe_quote.base_flow <= current_base_flow && safe_quote.quote_flow <= current_quote_flow,
+        "atomic safe quote must not increase depth during rebalance"
+    );
+
+    Ok(safe_quote)
+}
+
 fn cap_rebalance_to_withdrawable(
     plan: RebalancePlan,
     balances: &LiquidityPositionBalances,
@@ -1236,6 +1445,32 @@ fn ui_amount_to_lamports(amount_ui: f64, decimals: u8) -> u64 {
 mod tests {
     use super::*;
 
+    fn marker_instruction(marker: u8) -> Instruction {
+        Instruction {
+            program_id: Pubkey::new_from_array([marker; 32]),
+            accounts: Vec::new(),
+            data: vec![marker],
+        }
+    }
+
+    fn sample_built_swap() -> BuiltSwap {
+        BuiltSwap {
+            input_amount: 1,
+            expected_output: 1,
+            minimum_output: 1,
+            slippage_bps: 0,
+            price_impact_bps: None,
+            route_labels: Vec::new(),
+            compute_budget_instructions: Vec::new(),
+            setup_instructions: vec![marker_instruction(1), marker_instruction(2)],
+            swap_instruction: marker_instruction(5),
+            cleanup_instruction: Some(marker_instruction(7)),
+            other_instructions: vec![marker_instruction(8)],
+            tip_instruction: Some(marker_instruction(9)),
+            address_lookup_tables: Vec::new(),
+        }
+    }
+
     fn sample_balances(base_balance: u64, quote_balance: u64) -> LiquidityPositionBalances {
         LiquidityPositionBalances {
             base_balance,
@@ -1365,5 +1600,143 @@ mod tests {
         // withdrawable = 1_000 - (600 / LIQUIDITY_AMPLIFICATION=2) = 700; plan wants 900 → capped to 700
         assert_eq!(capped.withdraw_base_lamports, 700);
         assert_eq!(capped.withdraw_quote_lamports, 0);
+    }
+
+    #[test]
+    fn composes_safe_quote_before_withdraw_and_swap() {
+        let instructions = compose_atomic_rebalance_body(
+            &sample_built_swap(),
+            marker_instruction(3),
+            marker_instruction(4),
+            marker_instruction(6),
+        );
+
+        let markers = instructions
+            .iter()
+            .map(|instruction| instruction.data[0])
+            .collect::<Vec<_>>();
+        assert_eq!(markers, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn safe_quote_is_oracle_bounded_and_never_increases_depth() {
+        let balances = sample_balances(2_000_000_000, 100_000_000);
+        let price = PriceData {
+            price: 100.0,
+            timestamp: 0,
+        };
+        let plan = RebalancePlan {
+            direction: SwapDirection::BaseToQuote,
+            withdraw_base_lamports: 500_000_000,
+            withdraw_quote_lamports: 0,
+        };
+
+        let safe_quote =
+            plan_atomic_safe_quote(&price, &balances, plan, 1_200_000_000, 100_000_000, 9, 6)
+                .unwrap();
+
+        assert_eq!(
+            safe_quote,
+            SafeQuote {
+                base_flow: 1_000_000_000,
+                quote_flow: 100_000_000,
+            }
+        );
+        assert_eq!(
+            cap_rebalance_to_withdrawable(
+                plan,
+                &balances,
+                safe_quote.base_flow,
+                safe_quote.quote_flow,
+            ),
+            Some(plan)
+        );
+    }
+
+    #[test]
+    fn safe_quote_caps_depth_to_post_withdraw_inventory() {
+        let balances = sample_balances(2_000_000_000, 100_000_000);
+        let price = PriceData {
+            price: 100.0,
+            timestamp: 0,
+        };
+        let plan = RebalancePlan {
+            direction: SwapDirection::BaseToQuote,
+            withdraw_base_lamports: 1_400_000_000,
+            withdraw_quote_lamports: 0,
+        };
+
+        let safe_quote =
+            plan_atomic_safe_quote(&price, &balances, plan, 2_000_000_000, 200_000_000, 9, 6)
+                .unwrap();
+
+        assert_eq!(
+            safe_quote,
+            SafeQuote {
+                base_flow: 1_200_000_000,
+                quote_flow: 120_000_000,
+            }
+        );
+        assert!(safe_quote.base_flow / LIQUIDITY_AMPLIFICATION <= 600_000_000);
+        assert!(safe_quote.quote_flow / LIQUIDITY_AMPLIFICATION <= 100_000_000);
+    }
+
+    #[test]
+    fn safe_quote_rounds_ratio_down_from_oracle() {
+        let balances = sample_balances(1_000_000_000, 100_000_000);
+        let price = PriceData {
+            price: 97.660_036_84,
+            timestamp: 0,
+        };
+        let plan = RebalancePlan {
+            direction: SwapDirection::BaseToQuote,
+            withdraw_base_lamports: 1,
+            withdraw_quote_lamports: 0,
+        };
+
+        let safe_quote =
+            plan_atomic_safe_quote(&price, &balances, plan, 1_000_000_000, 100_000_000, 9, 6)
+                .unwrap();
+        let implied_price =
+            safe_quote.quote_flow as f64 / safe_quote.base_flow as f64 * 10f64.powi(3);
+
+        assert_eq!(safe_quote.quote_flow, 97_660_036);
+        assert!(implied_price <= price.price);
+    }
+
+    #[test]
+    fn safe_quote_fails_closed_for_zero_flow_side() {
+        let balances = sample_balances(1_000_000_000, 100_000_000);
+        let price = PriceData {
+            price: 100.0,
+            timestamp: 0,
+        };
+        let plan = RebalancePlan {
+            direction: SwapDirection::BaseToQuote,
+            withdraw_base_lamports: 1,
+            withdraw_quote_lamports: 0,
+        };
+
+        assert!(plan_atomic_safe_quote(&price, &balances, plan, 0, 100_000_000, 9, 6).is_err());
+        assert!(plan_atomic_safe_quote(&price, &balances, plan, 1_000_000_000, 0, 9, 6).is_err());
+    }
+
+    #[test]
+    fn safe_quote_fails_closed_for_zero_post_withdraw_inventory() {
+        let balances = sample_balances(1_000_000_000, 100_000_000);
+        let price = PriceData {
+            price: 100.0,
+            timestamp: 0,
+        };
+        let plan = RebalancePlan {
+            direction: SwapDirection::BaseToQuote,
+            withdraw_base_lamports: balances.base_balance,
+            withdraw_quote_lamports: 0,
+        };
+
+        assert!(
+            plan_atomic_safe_quote(&price, &balances, plan, 1_000_000_000, 100_000_000, 9, 6,)
+                .is_err()
+        );
     }
 }

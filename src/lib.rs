@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anchor_client::{Program, solana_sdk::signature::Keypair};
 use anchor_lang::prelude::*;
-use tracing::{info, warn};
+use anyhow::{Context, ensure};
+use tracing::info;
 
 pub mod accounts;
 pub mod constants;
@@ -13,7 +14,9 @@ pub mod state;
 pub use accounts::{AccountResolver, PdaResult};
 pub use constants::*;
 pub use instructions::*;
-pub use state::{MarketState, fetch_liquidity_position, fetch_market_state};
+pub use state::{
+    MarketState, fetch_liquidity_position, fetch_market_position_state, fetch_market_state,
+};
 
 declare_program!(twob_anchor);
 use twob_anchor::accounts::{Bookkeeping, LiquidityPosition, Market};
@@ -53,15 +56,20 @@ pub async fn get_liquidity_position_balances(
     bookkeeping: Bookkeeping,
     market: Market,
     current_slot: u64,
-) -> LiquidityPositionBalances {
+) -> anyhow::Result<LiquidityPositionBalances> {
     let resolver = AccountResolver::new(twob_anchor::ID);
     let market_pda = resolver.market_pda(market.id);
 
-    let elapsed_slots = current_slot - liquidity_position.last_update_slot;
+    let elapsed_slots = current_slot
+        .checked_sub(liquidity_position.last_update_slot)
+        .context("Current slot precedes liquidity position last update slot")?;
     let raw_inactive = bookkeeping
         .slots_without_trade
-        .saturating_sub(liquidity_position.slots_without_trade_snapshot);
-    let active_slots = elapsed_slots.saturating_sub(raw_inactive);
+        .checked_sub(liquidity_position.slots_without_trade_snapshot)
+        .context("Bookkeeping inactive-slot counter precedes liquidity position snapshot")?;
+    let active_slots = elapsed_slots
+        .checked_sub(raw_inactive)
+        .context("Inactive slots exceed elapsed liquidity position slots")?;
 
     info!(
         event.name = "liquidity_position_balance_slots",
@@ -71,15 +79,6 @@ pub async fn get_liquidity_position_balances(
         lp.inactive_slots = raw_inactive,
         lp.active_slots = active_slots,
     );
-    if raw_inactive > elapsed_slots {
-        warn!(
-            event.name = "liquidity_position_inactive_slots_saturated",
-            lp.inactive_slots = raw_inactive,
-            lp.elapsed_slots = elapsed_slots,
-            bookkeeping.slots_without_trade = bookkeeping.slots_without_trade,
-            lp.slots_without_trade_snapshot = liquidity_position.slots_without_trade_snapshot,
-        );
-    }
     info!(
         event.name = "liquidity_position_on_chain_balances",
         position.base_balance.raw = liquidity_position.base_balance,
@@ -92,162 +91,83 @@ pub async fn get_liquidity_position_balances(
 
     // Base token outflow since last update slot
     let accumulated_base_outflow = BOOKKEEPING_PRECISION_FACTOR
-        * active_slots as u128
-        * liquidity_position.base_flow_u64 as u128;
+        .checked_mul(active_slots as u128)
+        .and_then(|value| value.checked_mul(liquidity_position.base_flow_u64 as u128))
+        .context("Accumulated base outflow overflowed")?;
 
     // Quote token outflow since last update slot
     let accumulated_quote_outflow = BOOKKEEPING_PRECISION_FACTOR
-        * active_slots as u128
-        * liquidity_position.quote_flow_u64 as u128;
+        .checked_mul(active_slots as u128)
+        .and_then(|value| value.checked_mul(liquidity_position.quote_flow_u64 as u128))
+        .context("Accumulated quote outflow overflowed")?;
 
-    // Cacluclation token inflow is a bit tricky since we only have data up to bookkeeping last update slot.
-    // We need to go from there till current slot and loop through the exits accounts to adapt market flows
-    // First calculate correct base_per_quote and use that then.
-    let base_per_quote = {
-        let mut base_per_quote = bookkeeping.base_per_quote;
-        let mut market_base_flow = market.base_flow;
-        let mut market_quote_flow = market.quote_flow;
-        let mut last_update_slot = bookkeeping.last_update_slot;
+    ensure!(
+        market.end_slot_interval > 0,
+        "Market end slot interval must be greater than zero"
+    );
+    ensure!(
+        current_slot >= bookkeeping.last_update_slot,
+        "Current slot precedes bookkeeping last update slot"
+    );
 
-        let last_update_index = last_update_slot / ARRAY_LENGTH / market.end_slot_interval;
-        let current_slot_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
+    let exits_interval = market
+        .end_slot_interval
+        .checked_mul(ARRAY_LENGTH)
+        .context("Exits interval overflowed")?;
+    let last_update_index = bookkeeping.last_update_slot / exits_interval;
+    let current_slot_index = current_slot / exits_interval;
+    let exits_account_count = current_slot_index
+        .checked_sub(last_update_index)
+        .and_then(|value| value.checked_add(1))
+        .context("Exits account range overflowed")?;
+    let exits_account_capacity =
+        usize::try_from(exits_account_count).context("Exits account range is too large")?;
+    let mut exits_accounts = Vec::new();
+    exits_accounts
+        .try_reserve_exact(exits_account_capacity)
+        .context("Failed to reserve Exits account range")?;
 
-        // This will sum up all prices up to the last index of the last exits account
-        // After that we still need to sum up prices from that point until the current slot
-        for exits_index in last_update_index..=current_slot_index {
-            let exits_account_pda = resolver.exits_pda(&market_pda.address(), exits_index);
+    for exits_index in last_update_index..=current_slot_index {
+        let exits_account_pda = resolver.exits_pda(&market_pda.address(), exits_index);
+        let exits = program
+            .account::<Exits>(exits_account_pda.address())
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to fetch or decode Exits account {} for index {}",
+                    exits_account_pda.address(),
+                    exits_index,
+                )
+            })?;
+        ensure!(
+            exits.index == exits_index,
+            "Exits account {} has index {}, expected {}",
+            exits_account_pda.address(),
+            exits.index,
+            exits_index,
+        );
+        exits_accounts.push(exits);
+    }
 
-            let exits_account = program.account::<Exits>(exits_account_pda.address()).await;
-
-            let start_index = if exits_index == last_update_index {
-                (bookkeeping.last_update_slot
-                    - last_update_index * market.end_slot_interval * ARRAY_LENGTH)
-                    / market.end_slot_interval
-                    + 1
-            } else {
-                0
-            };
-
-            let end_index = if exits_index == current_slot_index {
-                (current_slot - current_slot_index * market.end_slot_interval * ARRAY_LENGTH)
-                    / market.end_slot_interval
-            } else {
-                ARRAY_LENGTH - 1
-            };
-
-            for i in start_index..=end_index {
-                let slot = i * market.end_slot_interval
-                    + exits_index * market.end_slot_interval * ARRAY_LENGTH;
-                let slot_diff = slot - last_update_slot;
-                last_update_slot = slot;
-
-                if market_base_flow == 0 || market_quote_flow == 0 {
-                    continue;
-                }
-                base_per_quote += BOOKKEEPING_PRECISION_FACTOR * market_base_flow
-                    / market_quote_flow
-                    * slot_diff as u128;
-
-                let base_exit = match exits_account {
-                    Ok(exits) => exits.base_exits[i as usize],
-                    Err(_) => 0,
-                };
-                let quote_exit = match exits_account {
-                    Ok(exits) => exits.quote_exits[i as usize],
-                    Err(_) => 0,
-                };
-                market_base_flow -= base_exit;
-                market_quote_flow -= quote_exit;
-            }
-
-            // After we went to all exits account we need to sum up prices up to current slot
-            if exits_index == current_slot_index {
-                let slot_diff = current_slot - last_update_slot;
-                if market_base_flow == 0 || market_quote_flow == 0 {
-                    continue;
-                }
-                base_per_quote += BOOKKEEPING_PRECISION_FACTOR * market_base_flow
-                    / market_quote_flow
-                    * slot_diff as u128;
-            }
-        }
-        base_per_quote
-    };
-
-    let quote_per_base = {
-        let mut quote_per_base = bookkeeping.quote_per_base;
-        let mut market_base_flow = market.base_flow;
-        let mut market_quote_flow = market.quote_flow;
-        let mut last_update_slot = bookkeeping.last_update_slot;
-
-        let last_update_index = last_update_slot / ARRAY_LENGTH / market.end_slot_interval;
-        let current_slot_index = current_slot / ARRAY_LENGTH / market.end_slot_interval;
-
-        for exits_index in last_update_index..=current_slot_index {
-            let exits_account_pda = resolver.exits_pda(&market_pda.address(), exits_index);
-            let exits_account = program.account::<Exits>(exits_account_pda.address()).await;
-
-            let start_index = if exits_index == last_update_index {
-                (bookkeeping.last_update_slot
-                    - last_update_index * market.end_slot_interval * ARRAY_LENGTH)
-                    / market.end_slot_interval
-                    + 1
-            } else {
-                0
-            };
-
-            let end_index = if exits_index == current_slot_index {
-                (current_slot - current_slot_index * market.end_slot_interval * ARRAY_LENGTH)
-                    / market.end_slot_interval
-            } else {
-                ARRAY_LENGTH - 1
-            };
-
-            for i in start_index..=end_index {
-                let slot = i * market.end_slot_interval
-                    + exits_index * market.end_slot_interval * ARRAY_LENGTH;
-                let slot_diff = slot - last_update_slot;
-                last_update_slot = slot;
-                if market_base_flow == 0 || market_quote_flow == 0 {
-                    continue;
-                }
-                quote_per_base += BOOKKEEPING_PRECISION_FACTOR * market_quote_flow
-                    / market_base_flow
-                    * slot_diff as u128;
-
-                let base_exit = match exits_account {
-                    Ok(exits) => exits.base_exits[i as usize],
-                    Err(_) => 0,
-                };
-                let quote_exit = match exits_account {
-                    Ok(exits) => exits.quote_exits[i as usize],
-                    Err(_) => 0,
-                };
-                market_base_flow -= base_exit;
-                market_quote_flow -= quote_exit;
-            }
-
-            // After we went to all exits account we need to sum up prices up to current slot
-            if exits_index == current_slot_index {
-                let slot_diff = current_slot - last_update_slot;
-                if market_base_flow == 0 || market_quote_flow == 0 {
-                    continue;
-                }
-                quote_per_base += BOOKKEEPING_PRECISION_FACTOR * market_quote_flow
-                    / market_base_flow
-                    * slot_diff as u128;
-            }
-        }
-        quote_per_base
-    };
+    let (base_per_quote, quote_per_base) = project_bookkeeping_prices(
+        &bookkeeping,
+        &market,
+        current_slot,
+        last_update_index,
+        &exits_accounts,
+    )?;
 
     // Base token inflow since last update slot
-    let accumulated_base_inflow = (base_per_quote - liquidity_position.base_per_quote_snapshot)
-        * liquidity_position.quote_flow_u64 as u128;
+    let accumulated_base_inflow = base_per_quote
+        .checked_sub(liquidity_position.base_per_quote_snapshot)
+        .and_then(|value| value.checked_mul(liquidity_position.quote_flow_u64 as u128))
+        .context("Accumulated base inflow overflowed or preceded its position snapshot")?;
 
     // Quote token inflow since last update slot
-    let accumulated_quote_inflow = (quote_per_base - liquidity_position.quote_per_base_snapshot)
-        * liquidity_position.base_flow_u64 as u128;
+    let accumulated_quote_inflow = quote_per_base
+        .checked_sub(liquidity_position.quote_per_base_snapshot)
+        .and_then(|value| value.checked_mul(liquidity_position.base_flow_u64 as u128))
+        .context("Accumulated quote inflow overflowed or preceded its position snapshot")?;
 
     info!(
         event.name = "liquidity_position_computed_flows",
@@ -259,29 +179,40 @@ pub async fn get_liquidity_position_balances(
 
     let base_balance;
     let base_debt;
-    if accumulated_base_outflow > liquidity_position.base_balance + accumulated_base_inflow {
+    let available_base = liquidity_position
+        .base_balance
+        .checked_add(accumulated_base_inflow)
+        .context("Available base balance overflowed")?;
+    if accumulated_base_outflow > available_base {
         base_balance = 0;
-        base_debt =
-            (accumulated_base_outflow - liquidity_position.base_balance - accumulated_base_inflow)
-                / BOOKKEEPING_PRECISION_FACTOR;
+        base_debt = accumulated_base_outflow
+            .checked_sub(available_base)
+            .context("Base debt underflowed")?
+            / BOOKKEEPING_PRECISION_FACTOR;
     } else {
-        base_balance = (liquidity_position.base_balance + accumulated_base_inflow
-            - accumulated_base_outflow)
+        base_balance = available_base
+            .checked_sub(accumulated_base_outflow)
+            .context("Base balance underflowed")?
             / BOOKKEEPING_PRECISION_FACTOR;
         base_debt = 0;
     }
 
     let quote_balance;
     let quote_debt;
-    if accumulated_quote_outflow > liquidity_position.quote_balance + accumulated_quote_inflow {
+    let available_quote = liquidity_position
+        .quote_balance
+        .checked_add(accumulated_quote_inflow)
+        .context("Available quote balance overflowed")?;
+    if accumulated_quote_outflow > available_quote {
         quote_balance = 0;
-        quote_debt = (accumulated_quote_outflow
-            - liquidity_position.quote_balance
-            - accumulated_quote_inflow)
+        quote_debt = accumulated_quote_outflow
+            .checked_sub(available_quote)
+            .context("Quote debt underflowed")?
             / BOOKKEEPING_PRECISION_FACTOR;
     } else {
-        quote_balance = (liquidity_position.quote_balance + accumulated_quote_inflow
-            - accumulated_quote_outflow)
+        quote_balance = available_quote
+            .checked_sub(accumulated_quote_outflow)
+            .context("Quote balance underflowed")?
             / BOOKKEEPING_PRECISION_FACTOR;
         quote_debt = 0;
     }
@@ -294,10 +225,193 @@ pub async fn get_liquidity_position_balances(
         position.quote_debt.raw = quote_debt,
     );
 
-    LiquidityPositionBalances {
-        base_balance: base_balance as u64,
-        quote_balance: quote_balance as u64,
-        base_debt: base_debt as u64,
-        quote_debt: quote_debt as u64,
+    Ok(LiquidityPositionBalances {
+        base_balance: u64::try_from(base_balance).context("Base balance exceeds u64")?,
+        quote_balance: u64::try_from(quote_balance).context("Quote balance exceeds u64")?,
+        base_debt: u64::try_from(base_debt).context("Base debt exceeds u64")?,
+        quote_debt: u64::try_from(quote_debt).context("Quote debt exceeds u64")?,
+    })
+}
+
+fn project_bookkeeping_prices(
+    bookkeeping: &Bookkeeping,
+    market: &Market,
+    current_slot: u64,
+    first_exits_index: u64,
+    exits_accounts: &[Exits],
+) -> anyhow::Result<(u128, u128)> {
+    ensure!(
+        market.end_slot_interval > 0,
+        "Market end slot interval must be greater than zero"
+    );
+
+    let exits_interval = market
+        .end_slot_interval
+        .checked_mul(ARRAY_LENGTH)
+        .context("Exits interval overflowed")?;
+    ensure!(
+        current_slot >= bookkeeping.last_update_slot,
+        "Current slot precedes bookkeeping last update slot"
+    );
+    let expected_first_exits_index = bookkeeping.last_update_slot / exits_interval;
+    ensure!(
+        first_exits_index == expected_first_exits_index,
+        "First Exits index {} does not match bookkeeping index {}",
+        first_exits_index,
+        expected_first_exits_index,
+    );
+    let current_slot_index = current_slot / exits_interval;
+    let expected_exits_count = current_slot_index
+        .checked_sub(first_exits_index)
+        .and_then(|value| value.checked_add(1))
+        .context("Expected Exits account range overflowed")?;
+    ensure!(
+        exits_accounts.len()
+            == usize::try_from(expected_exits_count)
+                .context("Exits account range exceeds usize")?,
+        "Expected {} Exits accounts, received {}",
+        expected_exits_count,
+        exits_accounts.len(),
+    );
+    let mut base_per_quote = bookkeeping.base_per_quote;
+    let mut quote_per_base = bookkeeping.quote_per_base;
+    let mut market_base_flow = market.base_flow;
+    let mut market_quote_flow = market.quote_flow;
+    let mut last_update_slot = bookkeeping.last_update_slot;
+
+    for (offset, exits) in exits_accounts.iter().enumerate() {
+        let exits_index = first_exits_index
+            .checked_add(u64::try_from(offset).context("Exits account offset exceeds u64")?)
+            .context("Exits account index overflowed")?;
+        ensure!(
+            exits.index == exits_index,
+            "Exits account has index {}, expected {}",
+            exits.index,
+            exits_index,
+        );
+
+        let interval_start = exits_index
+            .checked_mul(exits_interval)
+            .context("Exits interval start overflowed")?;
+        let start_index = if exits_index == first_exits_index {
+            bookkeeping
+                .last_update_slot
+                .checked_sub(interval_start)
+                .context("Bookkeeping last update slot precedes its exits interval")?
+                / market.end_slot_interval
+                + 1
+        } else {
+            0
+        };
+        let end_index = if exits_index == current_slot_index {
+            current_slot
+                .checked_sub(interval_start)
+                .context("Current slot precedes its exits interval")?
+                / market.end_slot_interval
+        } else {
+            ARRAY_LENGTH - 1
+        };
+        ensure!(
+            end_index < ARRAY_LENGTH,
+            "Exits end index {} is outside array length {}",
+            end_index,
+            ARRAY_LENGTH,
+        );
+
+        for i in start_index..=end_index {
+            let slot = interval_start
+                .checked_add(
+                    i.checked_mul(market.end_slot_interval)
+                        .context("Exit slot offset overflowed")?,
+                )
+                .context("Exit slot overflowed")?;
+            let slot_diff = slot
+                .checked_sub(last_update_slot)
+                .context("Exit slot precedes previous projection slot")?;
+            last_update_slot = slot;
+
+            if market_base_flow != 0 && market_quote_flow != 0 {
+                base_per_quote = base_per_quote
+                    .checked_add(flow_price_increment(
+                        market_base_flow,
+                        market_quote_flow,
+                        slot_diff,
+                    )?)
+                    .context("Accumulated base-per-quote overflowed")?;
+                quote_per_base = quote_per_base
+                    .checked_add(flow_price_increment(
+                        market_quote_flow,
+                        market_base_flow,
+                        slot_diff,
+                    )?)
+                    .context("Accumulated quote-per-base overflowed")?;
+            }
+
+            let array_index = usize::try_from(i).context("Exit array index exceeds usize")?;
+            market_base_flow = market_base_flow
+                .checked_sub(exits.base_exits[array_index])
+                .context("Scheduled base exit exceeds market base flow")?;
+            market_quote_flow = market_quote_flow
+                .checked_sub(exits.quote_exits[array_index])
+                .context("Scheduled quote exit exceeds market quote flow")?;
+        }
+    }
+
+    let slot_diff = current_slot
+        .checked_sub(last_update_slot)
+        .context("Current slot precedes final projection slot")?;
+    if market_base_flow != 0 && market_quote_flow != 0 {
+        base_per_quote = base_per_quote
+            .checked_add(flow_price_increment(
+                market_base_flow,
+                market_quote_flow,
+                slot_diff,
+            )?)
+            .context("Final base-per-quote accumulation overflowed")?;
+        quote_per_base = quote_per_base
+            .checked_add(flow_price_increment(
+                market_quote_flow,
+                market_base_flow,
+                slot_diff,
+            )?)
+            .context("Final quote-per-base accumulation overflowed")?;
+    }
+
+    Ok((base_per_quote, quote_per_base))
+}
+
+fn flow_price_increment(
+    numerator_flow: u128,
+    denominator_flow: u128,
+    slot_diff: u64,
+) -> anyhow::Result<u128> {
+    ensure!(denominator_flow > 0, "Flow price denominator is zero");
+
+    BOOKKEEPING_PRECISION_FACTOR
+        .checked_mul(numerator_flow)
+        .and_then(|value| value.checked_div(denominator_flow))
+        .and_then(|value| value.checked_mul(slot_diff as u128))
+        .context("Flow price increment overflowed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flow_price_increment_matches_existing_operation_order() {
+        let increment = flow_price_increment(200, 100, 3).unwrap();
+
+        assert_eq!(increment, BOOKKEEPING_PRECISION_FACTOR * 2 * 3);
+    }
+
+    #[test]
+    fn flow_price_increment_rejects_zero_denominator() {
+        assert!(flow_price_increment(100, 0, 1).is_err());
+    }
+
+    #[test]
+    fn flow_price_increment_rejects_overflow() {
+        assert!(flow_price_increment(u128::MAX, 1, 1).is_err());
     }
 }

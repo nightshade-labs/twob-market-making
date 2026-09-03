@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use anchor_client::{Program, solana_sdk::signature::Keypair};
+use anchor_client::{
+    Program,
+    solana_sdk::{account::Account, commitment_config::CommitmentConfig, signature::Keypair},
+};
 use anchor_lang::prelude::*;
 use anyhow::{Context, ensure};
 use tracing::info;
@@ -49,6 +52,24 @@ pub struct LiquidityPositionBalances {
     pub quote_balance: u64,
     pub base_debt: u64,
     pub quote_debt: u64,
+}
+
+const EXITS_BUCKET_COUNT: usize = ARRAY_LENGTH as usize;
+
+struct ExitSchedule {
+    base_exits: [u128; EXITS_BUCKET_COUNT],
+    quote_exits: [u128; EXITS_BUCKET_COUNT],
+    index: u64,
+}
+
+impl ExitSchedule {
+    fn empty(index: u64) -> Self {
+        Self {
+            base_exits: [0; EXITS_BUCKET_COUNT],
+            quote_exits: [0; EXITS_BUCKET_COUNT],
+            index,
+        }
+    }
 }
 pub async fn get_liquidity_position_balances(
     program: &Program<Arc<Keypair>>,
@@ -122,32 +143,41 @@ pub async fn get_liquidity_position_balances(
         .context("Exits account range overflowed")?;
     let exits_account_capacity =
         usize::try_from(exits_account_count).context("Exits account range is too large")?;
-    let mut exits_accounts = Vec::new();
-    exits_accounts
+    let mut exits_addresses = Vec::new();
+    exits_addresses
         .try_reserve_exact(exits_account_capacity)
         .context("Failed to reserve Exits account range")?;
 
     for exits_index in last_update_index..=current_slot_index {
         let exits_account_pda = resolver.exits_pda(&market_pda.address(), exits_index);
-        let exits = program
-            .account::<Exits>(exits_account_pda.address())
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to fetch or decode Exits account {} for index {}",
-                    exits_account_pda.address(),
-                    exits_index,
-                )
-            })?;
-        ensure!(
-            exits.index == exits_index,
-            "Exits account {} has index {}, expected {}",
-            exits_account_pda.address(),
-            exits.index,
-            exits_index,
-        );
-        exits_accounts.push(exits);
+        exits_addresses.push((exits_index, exits_account_pda.address()));
     }
+    let exit_pubkeys = exits_addresses
+        .iter()
+        .map(|(_, address)| *address)
+        .collect::<Vec<_>>();
+    let exits_response = program
+        .rpc()
+        .get_multiple_accounts_with_commitment(&exit_pubkeys, CommitmentConfig::confirmed())
+        .await
+        .context("Failed to fetch Exits account range")?;
+    ensure!(
+        exits_response.context.slot >= current_slot,
+        "Exits snapshot slot {} precedes core snapshot slot {}",
+        exits_response.context.slot,
+        current_slot,
+    );
+    ensure!(
+        exits_response.value.len() == exits_addresses.len(),
+        "Expected {} Exits account responses, received {}",
+        exits_addresses.len(),
+        exits_response.value.len(),
+    );
+    let exits_accounts = exits_addresses
+        .into_iter()
+        .zip(exits_response.value)
+        .map(|((index, address), account)| decode_exit_schedule(account, address, index))
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let (base_per_quote, quote_per_base) = project_bookkeeping_prices(
         &bookkeeping,
@@ -238,7 +268,7 @@ fn project_bookkeeping_prices(
     market: &Market,
     current_slot: u64,
     first_exits_index: u64,
-    exits_accounts: &[Exits],
+    exits_accounts: &[ExitSchedule],
 ) -> anyhow::Result<(u128, u128)> {
     ensure!(
         market.end_slot_interval > 0,
@@ -380,6 +410,38 @@ fn project_bookkeeping_prices(
     Ok((base_per_quote, quote_per_base))
 }
 
+fn decode_exit_schedule(
+    account: Option<Account>,
+    address: Pubkey,
+    expected_index: u64,
+) -> anyhow::Result<ExitSchedule> {
+    let Some(account) = account else {
+        return Ok(ExitSchedule::empty(expected_index));
+    };
+    ensure!(
+        account.owner == twob_anchor::ID,
+        "Exits account {} has unexpected owner {}",
+        address,
+        account.owner,
+    );
+    let mut data = account.data.as_slice();
+    let exits = Exits::try_deserialize(&mut data)
+        .with_context(|| format!("Failed to decode Exits account {address}"))?;
+    ensure!(
+        exits.index == expected_index,
+        "Exits account {} has index {}, expected {}",
+        address,
+        exits.index,
+        expected_index,
+    );
+
+    Ok(ExitSchedule {
+        base_exits: exits.base_exits,
+        quote_exits: exits.quote_exits,
+        index: exits.index,
+    })
+}
+
 fn flow_price_increment(
     numerator_flow: u128,
     denominator_flow: u128,
@@ -413,5 +475,28 @@ mod tests {
     #[test]
     fn flow_price_increment_rejects_overflow() {
         assert!(flow_price_increment(u128::MAX, 1, 1).is_err());
+    }
+
+    #[test]
+    fn missing_exits_account_is_an_empty_schedule() {
+        let schedule = decode_exit_schedule(None, Pubkey::new_unique(), 6_342_416).unwrap();
+
+        assert_eq!(schedule.index, 6_342_416);
+        assert_eq!(schedule.base_exits, [0; EXITS_BUCKET_COUNT]);
+        assert_eq!(schedule.quote_exits, [0; EXITS_BUCKET_COUNT]);
+    }
+
+    #[test]
+    fn malformed_existing_exits_account_fails_closed() {
+        let address = Pubkey::new_unique();
+        let account = Account {
+            lamports: 1,
+            data: vec![0; 8],
+            owner: twob_anchor::ID,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        assert!(decode_exit_schedule(Some(account), address, 1).is_err());
     }
 }
